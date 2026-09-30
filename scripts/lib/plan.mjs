@@ -2,9 +2,9 @@
 // price maths, and the bodies sent to the store. Pure functions only (no network, no files), so every rule
 // here is testable on its own.
 //
-// The plan is where each JUDGEMENT is recorded — retail price, rewritten copy, keep/exclude per image, how
-// each source option maps onto the store's variation library, and (for a retailer's content) the merchant's
-// confirmation that they may use it. `checkPlan` refuses until every one is made; that is the point of the
+// The plan is where each JUDGEMENT is recorded — retail price, rewritten copy, keep/exclude per image, the one
+// ratio and size every photo is made at, how each source option maps onto the store's variation library, and
+// (for a retailer's content) the merchant's confirmation that they may use it. `checkPlan` refuses until every one is made; that is the point of the
 // file. A rule written only in prose can be skipped; this one cannot.
 
 export const PLAN_KIND = 'import-plan/1';
@@ -23,8 +23,32 @@ export function newPlan() {
     created_at: new Date().toISOString(),
     store: { language: null, country: null, currency: null },
     pricing: { fx: null, multiplier: null, step: null, minus: null, compare_ratio: null },
+    photos: newPhotos(),
     products: [],
   };
+}
+
+// ── the photo target: ONE format, ONE ratio, ONE pixel size for every product photo ──────────────
+// A listing crops every photo to its own ratio, and a store-setup check refuses a catalogue that mixes formats,
+// ratios or sizes. The format is always JPEG (the one the shipped codec writes, and every browser shows).
+
+export const MIN_LONG_EDGE = 1000;
+export const LONG_EDGE_RANGE = [400, 2048];
+export const newPhotos = () => ({ ratio: null, long_edge: null, min_long_edge: MIN_LONG_EDGE });
+
+/**
+ * The pixel size every photo is made at: "1:1" + 1000 → 1000×1000, "3:4" + 1600 → 1200×1600.
+ * -> { key: "1:1@1000", width, height }   or   { error }
+ */
+export function targetOf(photos) {
+  const m = String(photos?.ratio ?? '').trim().match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+  const L = photos?.long_edge;
+  if (!m || !(Number(m[1]) > 0) || !(Number(m[2]) > 0)) return { error: 'photos.ratio is not set — "W:H", e.g. "1:1" (the ratio of the store\'s listing cards, or the one the merchant chose)' };
+  if (!Number.isInteger(L) || L < LONG_EDGE_RANGE[0] || L > LONG_EDGE_RANGE[1]) return { error: `photos.long_edge is not set — a whole number of pixels from ${LONG_EDGE_RANGE[0]} to ${LONG_EDGE_RANGE[1]}, the long side every photo is made at` };
+  const w = Number(m[1]), h = Number(m[2]);
+  const width = w >= h ? L : Math.round((L * w) / h);
+  const height = w >= h ? Math.round((L * h) / w) : L;
+  return { key: `${m[1]}:${m[2]}@${L}`, width, height };
 }
 
 /**
@@ -49,6 +73,7 @@ export function productEntry(src, images) {
     images: images.map((i) => ({
       file: i.file,
       source_url: i.url,
+      ...(i.original_url ? { original_url: i.original_url } : {}),
       roles: i.roles,
       values: i.values,
       decision: i.error ? 'exclude' : i.roles.every((r) => r === 'description') ? 'exclude' : 'unreviewed',
@@ -61,7 +86,8 @@ export function productEntry(src, images) {
       source_name: o.name,
       // An option with one value ("One size", "custom") is not a choice for a shopper: dropped by default.
       drop: o.values.length < 2,
-      global_variation: { slug: null, title_in_product: null, type: o.name === src.image_option ? 'images' : 'buttons' },
+      // error_msg: what a shopper reads when they order without choosing — needed when the import creates the type.
+      global_variation: { slug: null, title_in_product: null, type: o.name === src.image_option ? 'images' : 'buttons', error_msg: null },
       values: o.values.map((v) => ({ source_value: v, include: true, title: null, color_code: null })),
     })),
     variants: src.variants.map((v) => ({
@@ -76,13 +102,16 @@ export function productEntry(src, images) {
 /** Re-fetching keeps every decision already made; only products new to the plan get a fresh entry. */
 export function mergePlan(plan, entries) {
   const out = plan && plan.kind === PLAN_KIND ? plan : newPlan();
+  out.photos = { ...newPhotos(), ...(out.photos || {}) }; // a plan written before the photo target existed
   for (const e of entries) {
     const i = out.products.findIndex((p) => p.key === e.key);
     if (i === -1) { out.products.push(e); continue; }
     const old = out.products[i];
     e.images = e.images.map((img) => {
       const prev = old.images.find((x) => x.source_url === img.source_url);
-      return prev ? { ...img, decision: prev.decision, reason: prev.reason, alt: prev.alt } : img;
+      // the photos step's result stays with the file it was made from (import-photos checks it is still current)
+      return prev ? { ...img, decision: prev.decision, reason: prev.reason, alt: prev.alt,
+        ...(prev.final && prev.file === img.file ? { final: prev.final } : {}) } : img;
     });
     out.products[i] = { ...e, copy: old.copy, price: old.price, variant_prices: old.variant_prices,
       category: old.category, featured: old.featured ?? e.featured,
@@ -236,6 +265,8 @@ export function checkPlan(plan, sources, ctx = {}) {
   const err = (key, gate, message) => errs.push({ key, gate, message });
   if (plan?.kind !== PLAN_KIND) return [{ key: null, gate: 'plan', message: 'this is not an import plan (kind)' }];
   const maxBytes = ctx.maxBytes ?? 450 * 1024;
+  const target = targetOf(plan.photos);
+  if (target.error) err(null, 'photos', `${target.error}; then run import-photos.mjs`);
 
   for (const p of plan.products) {
     const src = sources[p.key];
@@ -278,6 +309,17 @@ export function checkPlan(plan, sources, ctx = {}) {
     if (!kept.length) err(p.key, 'images', 'no image kept — a product needs at least one');
     if (p.featured && kept.length && !kept.some((i) => i.file === p.featured)) err(p.key, 'images', `featured image ${p.featured} is not kept — point "featured" at a kept image`);
 
+    // PHOTOS — what is uploaded is the photos step's file, made at the plan's one ratio and size
+    if (!target.error) {
+      const notMade = kept.filter((i) => !i.error && (i.final?.target !== target.key || !i.final?.file));
+      if (notMade.length) err(p.key, 'photos', `${notMade.length} kept photo(s) not made at ${target.key} yet (${notMade.map((i) => i.file).join(', ')}) — run import-photos.mjs`);
+      for (const i of kept.filter((x) => x.final?.target === target.key && x.final?.file)) {
+        const bytes = ctx.fileBytes ? ctx.fileBytes(i.final.file) : null;
+        if (ctx.fileBytes && bytes == null) err(p.key, 'photos', `${i.final.file}: file missing — run import-photos.mjs`);
+        if (bytes != null && bytes > maxBytes) err(p.key, 'photos', `${i.final.file}: ${Math.round(bytes / 1024)} KB is over the ${Math.round(maxBytes / 1024)} KB ceiling`);
+      }
+    }
+
     // VARIANTS
     for (const oi of activeIdx(p)) {
       const o = p.options[oi];
@@ -315,6 +357,54 @@ export function checkPlan(plan, sources, ctx = {}) {
 }
 
 const hostOf = (u) => { try { return new URL(u).host; } catch { return ''; } };
+
+/**
+ * What the store's variation library means for the plan's types. `store` maps each planned slug to the store's
+ * type — { type, is_required, error_msg } — or null when the store has none (the import will create it).
+ * -> { errors: [{ key, gate, message }], warnings: [string] }
+ *
+ * A reused type keeps ITS display type: planning "images" on the store's colorbox "color" would upload swatch
+ * photos the store never shows. And ITS "required": the store takes "required" from the library type only — the
+ * per-product override the api lists is dropped on write and never read by the product page (plugin read
+ * 30-09-2026). An optional type lets a shopper order without choosing, and the order then does not say which
+ * colour or size. The import never changes a type it did not create, so it asks.
+ */
+export function libraryIssues(plan, store) {
+  const errors = [], warnings = [];
+  const usedBy = new Map(), first = new Map();
+  for (const p of plan.products || []) {
+    for (const o of (p.options || []).filter((x) => !x.drop)) {
+      const g = o.global_variation || {};
+      if (!g.slug) continue;
+      usedBy.set(g.slug, [...new Set([...(usedBy.get(g.slug) || []), p.key])]);
+      if (!first.has(g.slug)) first.set(g.slug, { g, key: p.key });
+      const existing = store[g.slug];
+      if (existing && existing.type && g.type && existing.type !== g.type) {
+        errors.push({ key: p.key, gate: 'door', message: `the store's variation type "${g.slug}" is "${existing.type}", the plan says "${g.type}" — set type "${existing.type}" to reuse it, or choose another slug` });
+      }
+    }
+  }
+  for (const [slug, { g, key }] of first) {
+    const who = usedBy.get(slug);
+    const existing = store[slug];
+    if (existing) {
+      if (existing.is_required !== 'yes') {
+        errors.push({ key: null, gate: 'variants', message: `the store's variation type "${slug}" is OPTIONAL (is_required: ${existing.is_required || 'not set'}) — a shopper could order ${who.length > 1 ? `these ${who.length} products` : 'this product'} (${who.join(', ')}) without choosing, and the order would not say which one. The import never changes a type it did not create. Ask the merchant: either they make "${slug}" required in the store's admin (Products → Variations → Edit on "${slug}" → "Is Required" → Yes; it applies to every product that uses it), or give this option a NEW slug and the import creates that type as required (the shop's filter then lists it as a separate group)` });
+      } else if (!String(existing.error_msg ?? '').trim()) {
+        warnings.push(`the store's variation type "${slug}" is required but has no message: a shopper who orders without choosing is stopped without being told why — the merchant can add one in the store's admin (Products → Variations → Edit on "${slug}" → "Error Message")`);
+      }
+    } else if (!String(g.error_msg ?? '').trim()) {
+      errors.push({ key, gate: 'variants', message: `variation type "${slug}" will be created, as required: set global_variation.error_msg — what a shopper reads when they order without choosing, in the store's language (e.g. "Choisissez une taille")` });
+    }
+  }
+  return { errors, warnings };
+}
+
+/** The ratio (width / height) of a listing's image box from its style ("aspect-ratio:1/1;…"), or null (a fixed height). */
+export function boxRatio(style) {
+  const m = String(style ?? '').match(/aspect-ratio\s*:\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/);
+  return m && Number(m[2]) > 0 ? { ratio: Number(m[1]) / Number(m[2]), label: `${m[1]}:${m[2]}` } : null;
+}
 
 /**
  * The kept photo that shows one value of an option (used for image swatches and photo switching). A photo's

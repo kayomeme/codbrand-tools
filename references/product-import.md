@@ -1,15 +1,16 @@
 # Importing products — from CJdropshipping, AliExpress, Alibaba, Shopify or WooCommerce stores, or any product page
 
-Three steps, and the middle one is yours:
+Four steps, and the second one is yours:
 
 ```
 1. FETCH    node scripts/import-fetch.mjs …        source → product-import/ (facts, photos under the upload ceiling, plan.json)
-2. REVIEW   you + the merchant fill plan.json      prices · copy · photos · variations · category · rights
-3. APPLY    node scripts/import-apply.mjs …        plan.json → the store, as DRAFTS; then --publish
+2. REVIEW   you + the merchant fill plan.json      prices · copy · photos · the photo target · variations · category · rights
+3. PHOTOS   node scripts/import-photos.mjs         every kept photo at ONE format, ratio and size (local; nothing sent)
+4. APPLY    node scripts/import-apply.mjs …        plan.json → the store, as DRAFTS; then --publish
 ```
 
-`import-apply.mjs` refuses while any decision in step 2 is missing or breaks a rule below, and lists every
-problem at once. Nothing is written to the store until it passes.
+`import-apply.mjs` refuses while any decision in step 2 is missing or breaks a rule below, or a kept photo was
+not made in step 3, and lists every problem at once. Nothing is written to the store until it passes.
 
 ## Before you start
 
@@ -101,7 +102,7 @@ in page-download.js to remove them once the file is safe.
 | file | what |
 |---|---|
 | `source/<key>.json` | the source's facts (title, description as text, specifications, category, brand, minimum order), options, variants with their SKUs, and the source's price per variant |
-| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it |
+| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it. When a URL names a resized copy (a WordPress, Shopify, AliExpress/Alibaba or BigCommerce thumbnail), the original is fetched instead if it is larger. The report lists every photo under the minimum long edge (`photos.min_long_edge`, 1000 px unless you change it) with its size |
 | `plan.json` | the decisions to make, pre-filled where a default is safe |
 | `review.html` | a contact sheet of every photo — open it in a browser, or show it to the merchant |
 
@@ -134,7 +135,7 @@ store's language, e.g. "Black hooded parka, front"). Every excluded one needs a 
 | `person` | a recognisable person (face visible) — recommend excluding; the merchant decides |
 | `foreign-text` | text in another language baked into the photo (labels, promo stickers) |
 | `size-chart` | a size chart or spec card — its facts go into the copy instead |
-| `duplicate`, `off-product`, `low-quality` | the same shot twice; not this product; blurry or tiny |
+| `duplicate`, `off-product`, `low-quality` | the same shot twice; not this product; blurry, or too small — fetch lists every photo under `photos.min_long_edge` (1000 px unless you change it) and `review.html` marks it in red. A small photo is enlarged in step 3 and looks softer; one that would need more than ×2 is refused there |
 | `description-image` | pre-set on photos taken from the source's description — keep one only if it earns its place |
 
 A cash-on-delivery customer who receives something other than the photo refuses it at the door, and the
@@ -198,7 +199,20 @@ source option set `global_variation`, or `drop: true`:
 - `slug` — **reuse** an existing type when it means the same thing (the store's "size" type), or name a new one;
 - `title_in_product` — the label shoppers see ("Taille");
 - `type` — `images` (photo swatches; pre-set on the option whose value decides the photo), `colorbox`
-  (colour dots — set `color_code` "#rrggbb" on each value), `buttons`, or `selectbox`.
+  (colour dots — set `color_code` "#rrggbb" on each value), `buttons`, or `selectbox`;
+- `error_msg` — what a shopper reads when they order without choosing, in the store's language ("Choisissez une
+  taille"). Needed for a type the import creates.
+
+**Every option the import attaches is required** — a shopper must choose a colour or size before ordering, or
+the order would not say which one. The store decides "required" on the library type, for every product that uses
+it (a per-product setting does not exist). So:
+
+- a type the import **creates** is created required, with your `error_msg`;
+- a type the store **already has** is reused only if it is required. If it is optional, `import-apply.mjs`
+  refuses and names it. **The import never changes a type it did not create** — ask the merchant: either they
+  make it required in the store's admin (Products → Variations → Edit on that type → "Is Required" → Yes; it
+  changes every product using it), or you give the option a new `slug`, and the import creates that type as
+  required (the shop's filter then lists it as a separate group).
 
 On each value set `title` (in the store's language; existing library options are matched by title) and
 `include: false` to drop a colour or size. Two values may not end up with the same title. A variant whose key
@@ -208,7 +222,40 @@ could not be split (a value containing "-", such as "2-3Y") has `source_values: 
 Each variant's SKU is the source's (CJ's variant SKU; for AliExpress and Alibaba the product and SKU ids), so
 an order in the store names exactly what to order from the supplier.
 
-## Step 3 — apply
+## Step 3 — photos: one format, one ratio, one size
+
+A listing crops every photo to its own image box, and photos of different sizes look differently sharp side by
+side. So every product photo of the store is made at **one** ratio and **one** pixel size, as JPEG. Set it once in
+`plan.json`:
+
+```json
+"photos": { "ratio": "1:1", "long_edge": 1000, "min_long_edge": 1000 }
+```
+
+- `ratio` — the ratio of the store's listing cards (their image box), or the one the merchant chose for the
+  catalogue. `1:1` suits objects; `3:4` or `2:3` things worn or standing. `import-apply.mjs` warns when the store's
+  listing box has another ratio.
+- `long_edge` — the long side in pixels (400–2048). Run `import-photos.mjs` without it: it prints how many kept
+  photos each size would enlarge. Pick the size most photos reach; a photo is enlarged at most ×2.
+- `min_long_edge` — below this, fetch and review list a photo as small (1000 unless you change it).
+
+```
+node scripts/import-photos.mjs --dry-run      what it would do to every kept photo; writes nothing
+node scripts/import-photos.mjs                makes them: images/<key>/final/…jpg, and review.html again
+```
+
+Each kept photo is **fitted inside** the frame — never cropped, so the product is never cut — and the rest is
+**padded with the photo's own edge colour**, each side with its own. On a studio shot the edge is one colour and
+the padding cannot be seen. On a scene (a room, a hand, a landscape) it shows as a band: those are named in the
+report and framed dashed in `review.html` — **look at each one** with the merchant, and exclude it if the band
+spoils it. A JPEG already at the exact size is kept as it is.
+
+It refuses, naming each photo: one that would be enlarged more than ×2 (exclude it as `low-quality`, or choose a
+smaller `long_edge`), one too detailed to fit 450 KB at that size, and a format nothing here can read. Changing
+`photos` or a kept photo means running it again; `import-apply.mjs` refuses a photo not made at the current
+target. It sends nothing to the store.
+
+## Step 4 — apply
 
 ```
 node scripts/import-apply.mjs <store URL> <API key> --dry-run      every check + the list of writes; writes nothing
@@ -216,7 +263,8 @@ node scripts/import-apply.mjs <store URL> <API key>                writes, as DR
 node scripts/import-apply.mjs <store URL> <API key> --publish      publishes them
 ```
 
-Show the merchant the dry run first. After the real run, **look at each product in the store** before
+Show the merchant the dry run first: per product it lists the photos as they will be uploaded
+(`photos: 8 → jpeg 1000×1000 (2 padded on a plain edge, …)`) and every write. After the real run, **look at each product in the store** before
 publishing: the product page renders, **each colour swatch shows its own photo** (not a broken-image icon),
 clicking each colour switches the main photo, every variant shows the price you set, and no source text or
 watermark slipped through. Look with your eyes (a screenshot), not only by reading the page's markup: a swatch
@@ -227,8 +275,10 @@ because the shop's filter counts only options on published products).
 
 Written after every product: the source (platform, id, URL), the store's product id, each variant's SKU and
 price, and every photo with its store media id, its source (platform, product id, the value it shows, the
-original URL) and what shrinking did to it. It is how a re-run UPDATES instead of duplicating, how an
-interrupted run resumes, and how a single photo can be traced and replaced later. Keep it with the project.
+original URL) and what was done to it (shrinking, and the photos step's changes). It is how a re-run UPDATES
+instead of duplicating, how an interrupted run resumes, and how a single photo can be traced and replaced later.
+Keep it with the project. When a re-run gives a product new photos, the ones it no longer uses are listed by
+media id — the import deletes nothing; the merchant removes them in the media library if nothing else uses them.
 
 ## When something refuses
 
@@ -238,6 +288,11 @@ interrupted run resumes, and how a single photo can be traced and replaced later
 | `HTTP 403 from the HOST` | the store's host or CDN refused before the store saw it: a burst, or a large body | wait a minute, run again (it resumes); photos are already under the ceiling |
 | `429` | the key's rate limit | the script waits and retries by itself |
 | `rights_confirmed` | a retailer's product, not yet confirmed | ask the merchant |
+| `photos.ratio is not set` / `not made at 1:1@1000 yet` | the photo target is missing, or a kept photo was not made at it | set `photos`, run `import-photos.mjs` |
+| `would be enlarged ×… — above ×2` | the photo is too small for `long_edge` | exclude it (`low-quality`) or choose a smaller `long_edge` |
+| `variation type "…" is OPTIONAL` | the store's type would let a shopper order without choosing | ask the merchant (see Variations) |
+| `set global_variation.error_msg` | a type to be created has no message for the shopper | write one, in the store's language |
+| `! listing design … box` (a warning) | the listing crops photos to another ratio | match `photos.ratio` to it, or the merchant changes the listing |
 | `slug "…" already belongs to product …` | another product has that slug | choose another `copy.slug` |
 | `category "…" does not exist` | a slug in `category.slugs` is not in the store | use an existing one, or add it to `category.create` |
 | `… no longer accepts …` | this copy of the skill does not match the store's plugin version | fetch the skill at the tag the store names |

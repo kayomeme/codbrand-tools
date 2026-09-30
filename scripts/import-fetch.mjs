@@ -13,7 +13,8 @@
  *
  * Writes, in <folder> (default ./product-import):
  *   source/<key>.json   what the source says about each product — facts for the rewrite, its price for reference
- *   images/<key>/…      every photo, already under the store's upload ceiling
+ *   images/<key>/…      every photo, already under the store's upload ceiling (the source's original when a URL names
+ *                       a resized copy of it); photos under the plan's minimum long edge are listed in the report
  *   plan.json           the decisions still to make — import-apply.mjs refuses until each is made
  *   review.html         a contact sheet of every photo, to open in a browser
  *
@@ -26,8 +27,9 @@ import { join, resolve, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fetchProduct, fromCapture, capturesIn, NeedsBrowser } from './lib/sources/index.mjs';
 import { cjClient } from './lib/sources/cj-api.mjs';
-import { download, shrink, MAX_BYTES } from './lib/images.mjs';
-import { productEntry, mergePlan, keyOf } from './lib/plan.mjs';
+import { downloadBest, shrink, MAX_BYTES } from './lib/images.mjs';
+import { productEntry, mergePlan, keyOf, MIN_LONG_EDGE } from './lib/plan.mjs';
+import { reviewHtml, PLATFORM, ROUTE, kb, sourceLongEdge } from './lib/review.mjs';
 
 const argv = process.argv.slice(2);
 const outIdx = argv.indexOf('--out');
@@ -35,9 +37,6 @@ const OUT = resolve(outIdx !== -1 ? argv[outIdx + 1] : 'product-import');
 const rest = outIdx === -1 ? argv : argv.filter((_, i) => i !== outIdx && i !== outIdx + 1);
 const pageMode = rest.includes('--page');
 const inputs = rest.filter((a) => a !== '--page');
-
-const PLATFORM = { cjdropshipping: 'CJdropshipping', aliexpress: 'AliExpress', alibaba: 'Alibaba', shopify: 'Shopify store', woocommerce: 'WooCommerce store', jsonld: 'product page (schema.org)' };
-const ROUTE = { api: 'official API', fetch: 'plain fetch', page: 'browser capture' };
 
 async function main() {
   if (!inputs.length) {
@@ -84,6 +83,7 @@ async function main() {
   const planPath = join(OUT, 'plan.json');
   const oldPlan = existsSync(planPath) ? JSON.parse(readFileSync(planPath, 'utf8')) : null;
   const entries = [];
+  const fetched = {}; // key -> this run's image list (for the report)
   for (const src of unique) {
     const key = keyOf(src);
     writeFileSync(join(OUT, 'source', `${key}.json`), JSON.stringify(src, null, 2) + '\n');
@@ -95,19 +95,26 @@ async function main() {
       n++;
       const stem = `${String(n).padStart(2, '0')}-${createHash('sha1').update(img.url).digest('hex').slice(0, 8)}`;
       const prev = old?.images?.find((x) => x.source_url === img.url && x.file && existsSync(join(OUT, x.file)));
-      if (prev) { images.push({ file: prev.file, url: img.url, roles: img.roles, values: img.values, shrink: prev.shrink, ...(prev.error ? { error: prev.error } : {}) }); continue; }
+      if (prev) {
+        images.push({ file: prev.file, url: img.url, roles: img.roles, values: img.values, shrink: prev.shrink,
+          ...(prev.original_url ? { original_url: prev.original_url } : {}), ...(prev.error ? { error: prev.error } : {}) });
+        continue;
+      }
       try {
-        const raw = await download(img.url);
-        const r = await shrink(raw, { url: img.url });
+        // the source's own original when the URL names a resized copy of it, and it is larger
+        const got = await downloadBest(img.url);
+        const r = await shrink(got.buffer, { url: got.url });
         if (r.error) { images.push({ file: null, url: img.url, roles: img.roles, values: img.values, shrink: null, error: r.error }); continue; }
         const file = `images/${key}/${stem}.${r.ext}`;
         writeFileSync(join(OUT, file), r.buffer);
         images.push({ file, url: img.url, roles: img.roles, values: img.values,
+          ...(got.url !== img.url ? { original_url: got.url, larger: got.larger } : {}),
           shrink: { engine: r.engine, from: slim(r.from), to: slim(r.to), ...(r.warning ? { warning: r.warning } : {}) } });
       } catch (e) {
         images.push({ file: null, url: img.url, roles: img.roles, values: img.values, shrink: null, error: e.message });
       }
     }
+    fetched[key] = images;
     entries.push(productEntry(src, images));
   }
 
@@ -119,11 +126,15 @@ async function main() {
   writeFileSync(join(OUT, 'review.html'), reviewHtml(plan, all));
 
   // ── 4. the report ──
+  const minEdge = plan.photos?.min_long_edge ?? MIN_LONG_EDGE;
   console.log(`Product import — ${unique.length} product(s) into ${relative(process.cwd(), OUT) || '.'}\n`);
   for (const e of entries) {
     const src = unique.find((p) => keyOf(p) === e.key);
     const shrunk = e.images.filter((i) => i.shrink && i.shrink.engine !== 'none');
     const failed = e.images.filter((i) => i.error);
+    const larger = (fetched[e.key] || []).filter((i) => i.larger);
+    // what the SOURCE offers, before any shrinking — description images included, the review decides on them
+    const small = e.images.filter((i) => !i.error && sourceLongEdge(i) != null && sourceLongEdge(i) < minEdge);
     const amb = e.variants.filter((v) => !Array.isArray(v.source_values)).length;
     const dropped = e.options.filter((o) => o.drop).map((o) => o.source_name);
     console.log(`• ${src.facts.title}  [${e.key}]`);
@@ -131,61 +142,18 @@ async function main() {
     console.log(`    ${src.variants.length} variant(s)${src.options.length ? ` — ${src.options.map((o) => `${o.name}: ${o.values.length}`).join(', ')}` : ''}${src.image_option ? `; photo follows ${src.image_option}` : ''}${dropped.length ? `; dropped by default (one value): ${dropped.join(', ')}` : ''}${amb ? `; ${amb} to resolve by hand` : ''}`);
     console.log(`    ${e.images.length} image(s): ${e.images.filter((i) => i.decision === 'unreviewed').length} to review, ${e.images.filter((i) => i.decision === 'exclude').length} excluded by default (description images, failures)`);
     if (shrunk.length) console.log(`    shrunk ${shrunk.length}: ${shrunk.map((i) => `${kb(i.shrink.from.bytes)}→${kb(i.shrink.to.bytes)} (${i.shrink.engine})`).join(', ')}`);
+    if (larger.length) console.log(`    larger original used for ${larger.length}: ${larger.map((i) => `${i.larger.from.join('×')} → ${i.larger.to.join('×')}`).join(', ')}`);
+    if (small.length) console.log(`    under ${minEdge} px on the long edge (${small.length}): ${small.map((i) => `${i.file} ${i.shrink.from.width}×${i.shrink.from.height}`).join(', ')}`);
     for (const f of failed) console.log(`    ✗ ${f.url}: ${f.error}`);
     const pr = src.price;
     console.log(`    source ${pr.kind === 'cost' ? 'cost' : 'price'} ${pr.min ?? '?'}${pr.max != null && pr.max !== pr.min ? `–${pr.max}` : ''} ${pr.currency || '(currency unknown)'} — reference only; never a store price`);
     if (src.facts.moq > 1) console.log(`    ⚠ minimum order on the source: ${src.facts.moq} — check it can be bought one at a time before selling it`);
   }
-  console.log(`\nNext: open review.html, then fill plan.json (prices, copy, image decisions, variations${unique.some((p) => !p.supplier) ? ', rights' : ''}) and run import-apply.mjs.`);
-  console.log(`Every image is at most ${kb(MAX_BYTES)}.`);
+  console.log(`\nNext: open review.html, then fill plan.json (prices, copy, image decisions, the photo target, variations${unique.some((p) => !p.supplier) ? ', rights' : ''}), run import-photos.mjs, then import-apply.mjs.`);
+  console.log(`Every image is at most ${kb(MAX_BYTES)}. A photo under ${minEdge} px on its long edge, as the source offers it, is listed above and shown in red in review.html.`);
   return 0;
 }
 
 const slim = (p) => ({ format: p.format, width: p.width, height: p.height, bytes: p.bytes });
-const kb = (b) => `${Math.round(b / 1024)} KB`;
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-function reviewHtml(plan, sources) {
-  const cards = plan.products.map((p) => {
-    const s = sources[p.key];
-    if (!s) return '';
-    const imgs = p.images.map((i) => `
-      <figure class="${esc(i.decision)}">
-        ${i.file ? `<img src="${esc(i.file)}" loading="lazy" alt="">` : '<div class="missing">not downloaded</div>'}
-        <figcaption><b>${esc(i.file || '—')}</b><br>${esc(i.roles.join(' + '))}${i.values?.length ? ` · ${esc(i.values.join(', '))}` : ''}<br>
-        ${i.shrink ? `${kb(i.shrink.from.bytes)} ${i.shrink.from.width}×${i.shrink.from.height} → ${kb(i.shrink.to.bytes)} ${i.shrink.to.width}×${i.shrink.to.height} (${esc(i.shrink.engine)})` : esc(i.error || '')}<br>
-        <span class="dec">${esc(i.decision)}${i.reason ? ` — ${esc(i.reason)}` : ''}</span></figcaption>
-      </figure>`).join('');
-    const specs = s.facts.specs.length ? `<table>${s.facts.specs.map((x) => `<tr><th>${esc(x.name)}</th><td>${esc(x.value)}</td></tr>`).join('')}</table>` : '';
-    return `
-    <section>
-      <h2>${esc(s.facts.title)}</h2>
-      <p class="meta">${esc(PLATFORM[s.platform] || s.platform)} · ${esc(s.pid)}${s.product_sku ? ` · SKU ${esc(s.product_sku)}` : ''} · ${esc(ROUTE[s.route] || s.route)}${s.url ? ` · <a href="${esc(s.url)}">source page</a>` : ''}</p>
-      ${s.supplier ? '' : '<p class="warn">A retailer\'s own content — use it only if the merchant confirms they may (rights_confirmed).</p>'}
-      ${s.facts.moq > 1 ? `<p class="warn">Minimum order on the source: ${esc(s.facts.moq)}.</p>` : ''}
-      <p class="meta">${esc(s.facts.category_path.join(' › '))}${s.facts.brand ? ` · brand: ${esc(s.facts.brand)}` : ''}${s.facts.material.length ? ` · material: ${esc(s.facts.material.join(', '))}` : ''}</p>
-      <p class="meta">${s.options.map((o) => `${esc(o.name)}: ${esc(o.values.join(', '))}`).join('<br>')}</p>
-      <p class="cost">Source ${s.price.kind === 'cost' ? 'cost' : 'price'} ${esc(s.price.min)}${s.price.max != null && s.price.max !== s.price.min ? `–${esc(s.price.max)}` : ''} ${esc(s.price.currency || '')} — reference for pricing, never shown to shoppers</p>
-      ${specs ? `<details><summary>Specifications (facts to rewrite)</summary>${specs}</details>` : ''}
-      ${s.facts.description_text ? `<details><summary>The source's description (facts to rewrite — never publish as-is)</summary><pre>${esc(s.facts.description_text)}</pre></details>` : ''}
-      <div class="grid">${imgs}</div>
-    </section>`;
-  }).join('');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Product import review</title><style>
-body{font:14px/1.45 system-ui,sans-serif;margin:0;padding:16px;background:#f6f6f4;color:#1b1b1b}
-section{background:#fff;border-radius:10px;padding:16px;margin:0 0 20px;box-shadow:0 1px 3px #0001}
-h2{margin:0 0 6px;font-size:18px}.meta{margin:2px 0;color:#555}.cost{margin:8px 0;color:#8a4b00}.warn{margin:6px 0;color:#b00020;font-weight:600}
-pre{white-space:pre-wrap;background:#fafafa;padding:8px;border-radius:6px;max-height:320px;overflow:auto}
-table{border-collapse:collapse;margin:6px 0}th,td{text-align:left;padding:2px 10px 2px 0;vertical-align:top}th{color:#555;font-weight:500}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:12px}
-figure{margin:0;border:2px solid #ddd;border-radius:8px;overflow:hidden;background:#fff}
-figure.keep{border-color:#2e7d32}figure.exclude{border-color:#c62828;opacity:.6}
-figure img{width:100%;aspect-ratio:1;object-fit:contain;background:#eee;display:block}
-figcaption{font-size:12px;padding:6px;word-break:break-all}.dec{font-weight:600}.missing{aspect-ratio:1;display:grid;place-items:center;background:#eee}
-</style></head><body><h1>Product import review</h1>
-<p>Each photo is shown as it will be uploaded. Exclude watermarks, logos or brand marks, recognisable people, and text in another language. Decisions go in plan.json.</p>
-${cards}</body></html>`;
-}
 
 main().then((code) => { process.exitCode = code; }, (e) => { console.error(`✗ ${e.message}`); process.exitCode = 1; });

@@ -13,6 +13,9 @@
 //                      `sips` (macOS), ImageMagick (`magick`, or `convert` outside Windows), or
 //                      PowerShell's built-in imaging (Windows).
 // If none can, the image is refused and named — it is never uploaded oversized.
+//
+// Also here: the download asks for JPEG/PNG and prefers the original of a resized copy (downloadBest), and toPng()
+// converts what the codec cannot read, for the photos step (photos.mjs).
 
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -32,18 +35,70 @@ const QUALITIES = [85, 75, 65, 55];
 // giving up: 1600 → 1280 → 1024 → 800 px on the long edge.
 const edgeSteps = (maxEdge) => [...new Set([maxEdge, Math.round(maxEdge * 0.8), Math.round(maxEdge * 0.64), Math.min(800, maxEdge)])];
 const UA = 'Mozilla/5.0 (compatible; codbrand-tools image fetch)';
+// JPEG or PNG only, never a wildcard. Measured 30-09-2026: AliExpress's image CDN answers any Accept that allows
+// `image/*` (even `image/*;q=0.5`) with a re-encoded WebP — 121 KB instead of the 349 KB JPEG it stores — and sends
+// the stored JPEG when only these two are allowed. A file stored as WebP comes back as WebP either way (measured);
+// a server that refuses the narrow list (406) is asked again with `image/*`.
+const ACCEPT = 'image/jpeg,image/png';
 
 /** GET an image. Two tries, 30 s each. */
 export async function download(url) {
   let last;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const r = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'image/*' }, signal: AbortSignal.timeout(30000) });
+      const get = (accept) => fetch(url, { headers: { 'User-Agent': UA, Accept: accept }, signal: AbortSignal.timeout(30000) });
+      let r = await get(ACCEPT);
+      if (r.status === 406) r = await get('image/*');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return Buffer.from(await r.arrayBuffer());
     } catch (e) { last = e; }
   }
   throw new Error(`could not download ${url}: ${last.message}`);
+}
+
+/**
+ * The original of a photo whose URL names a resized copy, or null. Each pattern was fetched both ways, 30-09-2026:
+ *   WordPress    …/wp-content/uploads/…/name-600x731.jpg              600×731 → name.jpg             960×1170
+ *   Shopify      cdn.shopify.com/…/name_300x.png                      300×300 → name.png            4000×4000
+ *   alicdn       …/kf/S….jpg_120x120.jpg_.webp                        120×120 → …/kf/S….jpg           800×800
+ *                …/kf/H….png_350x350.png                              350×350 → …/kf/H….png         1024×1024
+ *   BigCommerce  …/products/80/images/272/name.1456436717.500.750.jpg 500×500 →
+ *                …/images/stencil/original/products/80/272/name.1456436717.jpg                       1000×1000
+ *                …/images/stencil/1280x1280/… → …/images/stencil/original/…
+ * It is only a guess: downloadBest() keeps the original only when it downloads and is larger.
+ */
+export function originalOf(url) {
+  let u;
+  try { u = new URL(url); } catch { return null; }
+  const host = u.host.toLowerCase();
+  const p = u.pathname;
+  const EXT = '(\\.(?:jpe?g|png|gif|webp))';
+  let q = null;
+  if (/\/wp-content\/uploads\//.test(p)) q = p.replace(new RegExp(`-\\d{2,5}x\\d{2,5}${EXT}$`, 'i'), '$1');
+  else if (/(^|\.)shopify\.com$/.test(host) || /\/cdn\/shop\//.test(p)) {
+    q = p.replace(new RegExp(`_(?:\\d{1,5}x\\d{0,5}|x\\d{1,5}|pico|icon|thumb|small|compact|medium|large|grande|master|original)(?:@\\dx)?${EXT}$`, 'i'), '$1');
+  } else if (/(^|\.)(alicdn\.com|aliexpress-media\.com)$/.test(host)) q = p.replace(/(\.(?:jpe?g|png|webp))_[^/]*$/i, '$1');
+  else if (/(^|\.)bigcommerce\.com$/.test(host)) {
+    q = p.replace(/\/images\/stencil\/[^/]+\//, '/images/stencil/original/');
+    const m = q === p ? p.match(new RegExp(`^(.*)/products/(\\d+)/images/(\\d+)/(.+?)\\.\\d+\\.\\d+${EXT}$`, 'i')) : null;
+    if (m) q = `${m[1]}/images/stencil/original/products/${m[2]}/${m[3]}/${m[4]}${m[5]}`;
+  }
+  if (!q || q === p) return null;
+  u.pathname = q;
+  return u.href;
+}
+
+/** download(url) — or the original it is a resized copy of, when that downloads and is larger. */
+export async function downloadBest(url) {
+  const given = await download(url);
+  const orig = originalOf(url);
+  if (!orig) return { buffer: given, url };
+  let big;
+  try { big = await download(orig); } catch { return { buffer: given, url }; }
+  const a = probe(given), b = probe(big);
+  const edge = (x) => Math.max(x.width || 0, x.height || 0);
+  if (b.format === 'unknown' || edge(b) <= edge(a)) return { buffer: given, url };
+  return { buffer: big, url: orig, larger: { from: [a.width, a.height], to: [b.width, b.height] } };
 }
 
 /** Format and pixel size from the file header — no decoding. */
@@ -89,10 +144,10 @@ const EXT = { jpeg: 'jpg', png: 'png', gif: 'gif', webp: 'webp', avif: 'avif', h
 export const extFor = (format) => EXT[format] || 'bin';
 
 // ── engine 1: CJ's image server ───────────────────────────────────────────────────────────────────
+const isCj = (url) => { try { return /(^|\.)cjdropshipping\.com$/i.test(new URL(url).host); } catch { return false; } };
+
 async function sourceServer(url, maxEdge, maxBytes) {
-  let host;
-  try { host = new URL(url).host; } catch { return null; }
-  if (!/(^|\.)cjdropshipping\.com$/i.test(host)) return null;
+  if (!isCj(url)) return null;
   for (const edge of edgeSteps(maxEdge)) {
     for (const q of QUALITIES) {
       let buf;
@@ -221,7 +276,7 @@ export function decodePng(b) {
 }
 
 /** Transparency composited onto white — a JPEG has no alpha, and black is what "no alpha" looks like. */
-function flattenWhite(d) {
+export function flattenWhite(d) {
   for (let i = 0; i < d.length; i += 4) {
     const a = d[i + 3];
     if (a === 255) continue;
@@ -303,7 +358,7 @@ export function codecShrink(buf, from, maxEdge = MAX_EDGE, maxBytes = MAX_BYTES)
 
 // ── engine 3: a tool this machine already has ─────────────────────────────────────────────────────
 let toolCache;
-function localTool() {
+export function localTool() {
   if (toolCache !== undefined) return toolCache;
   const has = (cmd, args) => { try { return spawnSync(cmd, args, { stdio: 'ignore', timeout: 15000 }).status === 0; } catch { return false; } };
   if (process.platform === 'darwin' && has('sips', ['--help'])) toolCache = 'sips';
@@ -374,6 +429,55 @@ function localEngine(buf, from, maxEdge, maxBytes) {
       if (!needsResize) break;
     }
     return null;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Windows' own imaging again, as a CONVERTER only: any format it reads → a plain (not interlaced) PNG, which the
+// shipped codec then reads. Measured 30-09-2026 on Windows 10: a WebP decodes ("Microsoft Webp Decoder") and the
+// PNG it writes decodes in decodePng().
+const PS_PNG = `
+Add-Type -AssemblyName PresentationCore
+$s = [IO.File]::OpenRead($in)
+try {
+  $dec = [Windows.Media.Imaging.BitmapDecoder]::Create($s, [Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+} finally { $s.Close() }
+$e = New-Object Windows.Media.Imaging.PngBitmapEncoder
+$e.Interlace = [Windows.Media.Imaging.PngInterlaceOption]::Off
+$e.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($dec.Frames[0]))
+$o = [IO.File]::Create($out)
+try { $e.Save($o) } finally { $o.Close() }
+`;
+
+/**
+ * A PNG the codec can read, for a file it cannot (WebP, AVIF, HEIC, GIF, an interlaced PNG) — or null.
+ * CJ's image server converts on request (measured: `x-oss-process=image/format,png` returns a PNG); anything else
+ * goes through a tool this machine has.
+ */
+export async function toPng(buf, from, url = null) {
+  if (url && isCj(url)) {
+    try {
+      const b = await download(`${url}?x-oss-process=image/format,png`);
+      if (probe(b).format === 'png') return b;
+    } catch { /* the machine's own tool below */ }
+  }
+  const tool = localTool();
+  if (!tool) return null;
+  const dir = mkdtempSync(join(tmpdir(), 'cj-img-'));
+  try {
+    const input = join(dir, `in.${extFor(from.format)}`);
+    const output = join(dir, 'out.png');
+    writeFileSync(input, buf);
+    let r;
+    if (tool === 'sips') r = spawnSync('sips', ['-s', 'format', 'png', input, '--out', output], { stdio: 'ignore', timeout: 60000 });
+    else if (tool === 'magick' || tool === 'convert') r = spawnSync(tool, [input, '-auto-orient', '-interlace', 'none', output], { stdio: 'ignore', timeout: 60000 });
+    else {
+      const script = `$in = ${psQuote(input)}; $out = ${psQuote(output)}\n${PS_PNG}`;
+      r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { stdio: 'ignore', timeout: 60000 });
+    }
+    if (r.status !== 0) return null;
+    let out;
+    try { out = readFileSync(output); } catch { return null; }
+    return probe(out).format === 'png' ? out : null;
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

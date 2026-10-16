@@ -8,7 +8,10 @@
  * pixel size, as JPEG, under the store's upload ceiling: fitted inside the frame (never cropped), the rest padded
  * with the photo's own edge colour, enlarged at most ×2. Writes images/<key>/final/…jpg, records on each photo in
  * plan.json what was changed, and writes review.html again so every photo can be looked at as it will be uploaded.
- * Nothing is sent to the store; import-apply.mjs uploads these files and refuses a photo that was not made here.
+ * It also draws CONTACT SHEETS an agent can open as images (sheets/<key>-all-N.jpg: every candidate, numbered and
+ * framed green/red by decision; sheets/<key>-kept-N.jpg: the kept set exactly as it will be uploaded; a legend
+ * sheets/<key>.txt). Nothing is sent to the store; import-apply.mjs uploads these files, and refuses a photo that
+ * was not made here and a product whose kept sheet is older than its kept photos.
  *
  *   --dry-run   the same report, nothing written
  *
@@ -18,8 +21,9 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, resolve, dirname, basename } from 'node:path';
 import { createHash } from 'node:crypto';
-import { targetOf, keyOf, MIN_LONG_EDGE } from './lib/plan.mjs';
-import { makePhoto } from './lib/photos.mjs';
+import { targetOf, keyOf, galleryOrder, keptFingerprint, MIN_LONG_EDGE } from './lib/plan.mjs';
+import { makePhoto, readPixels } from './lib/photos.mjs';
+import { drawSheet, pages } from './lib/sheets.mjs';
 import { reviewHtml, kb, sourceLongEdge } from './lib/review.mjs';
 
 const argv = process.argv.slice(2);
@@ -73,10 +77,13 @@ async function main() {
   const errors = [];
   const tally = { photos: 0, cached: 0, unchanged: 0, converted: 0, plain: 0, scene: 0, enlarged: 0, reduced: 0, maxUp: 1 };
   const small = [];
+  const sheetsMade = [];
   for (const p of plan.products) {
+    if (p.skip) continue;
     const kept = keptOf(p);
     if (!kept.length) continue;
     say(`• ${p.copy?.title || sources[p.key]?.facts?.title || p.key}  [${p.key}]`);
+    const failedBefore = errors.length;
     for (const img of kept) {
       tally.photos++;
       const edge = sourceLongEdge(img);
@@ -89,6 +96,8 @@ async function main() {
       if (f && f.target === target.key && f.source_sha === srcSha && existsSync(join(DIR, f.file))) {
         tally.cached++;
         count(tally, f);
+        // the made file's own hash lets import-apply reuse its upload without the file (made before it existed)
+        if (!f.sha256 && !DRY) f.sha256 = sha(readFileSync(join(DIR, f.file)));
         continue; // already made from this very file at this target
       }
       const r = await makePhoto(bytes, target, { url: img.original_url || img.source_url });
@@ -98,7 +107,7 @@ async function main() {
         continue;
       }
       const file = `${dirname(img.file)}/final/${basename(img.file).replace(/\.[^.]+$/, '')}.jpg`;
-      const final = { file, target: target.key, source_sha: srcSha, from: slim(r.from), to: r.to, changes: r.changes, edge: r.edge, quality: r.quality };
+      const final = { file, target: target.key, source_sha: srcSha, sha256: sha(r.buffer), from: slim(r.from), to: r.to, changes: r.changes, edge: r.edge, quality: r.quality };
       count(tally, final);
       say(`    ${basename(img.file)}  ${r.from.format} ${r.from.width}×${r.from.height} → ${target.width}×${target.height}, ${kb(r.to.bytes)}${r.changes.length ? ` — ${r.changes.join('; ')}` : ' — already right, kept as it is'}`);
       if (!DRY) {
@@ -106,6 +115,12 @@ async function main() {
         writeFileSync(join(DIR, file), r.buffer);
         img.final = final;
       }
+    }
+    // the contact sheets: every candidate, and the kept set exactly as it will be uploaded
+    if (!DRY && errors.length === failedBefore) {
+      const made = await drawSheets(p, target);
+      sheetsMade.push(...made);
+      say(`    sheets: ${made.join(', ')} — open the kept one and look at every photo`);
     }
   }
 
@@ -118,9 +133,51 @@ async function main() {
   if (!DRY) {
     writeFileSync(planPath, JSON.stringify(plan, null, 2) + '\n');
     writeFileSync(join(DIR, 'review.html'), reviewHtml(plan, sources));
-    say(`\nplan.json and review.html updated. ${errors.length ? 'Fix the photos above, then run this again.' : 'Next: import-apply.mjs --dry-run.'}`);
+    say(`\nplan.json and review.html updated.${sheetsMade.length ? ` Contact sheets in ${join(DIR, 'sheets')} — OPEN each "-kept" sheet and look at every photo (the legend .txt names each number); import-apply.mjs refuses until each product's kept sheet is current.` : ''} ${errors.length ? 'Fix the photos above, then run this again.' : 'Next: import-apply.mjs --dry-run.'}`);
   }
   return errors.length ? 1 : 0;
+}
+
+/**
+ * One product's contact sheets and legend: sheets/<key>-all-N.jpg (every candidate, numbered in plan order, framed
+ * by decision), sheets/<key>-kept-N.jpg (the made files in gallery order, the featured one first) and
+ * sheets/<key>.txt. Records the kept set's fingerprint on the product (kept_sheet), which import-apply checks.
+ */
+async function drawSheets(p, target) {
+  const dir = join(DIR, 'sheets');
+  mkdirSync(dir, { recursive: true });
+  const read = async (file, url) => { try { return await readPixels(readFileSync(join(DIR, file)), url); } catch { return null; } };
+  const files = [];
+  const legend = [`${p.key} — ${p.copy?.title || ''}`.trim(), '', 'every candidate (sheets …-all-N.jpg): number  file  size  KB  decision'];
+  const all = [];
+  let n = 0;
+  for (const img of p.images) {
+    if (!img.file) continue;
+    n++;
+    all.push({ img: await read(img.file, img.original_url || img.source_url), n, frame: img.decision === 'keep' ? 'keep' : img.decision === 'exclude' ? 'exclude' : 'other' });
+    const s = img.shrink?.to;
+    legend.push(`  ${String(n).padStart(2)}  ${img.file}  ${s ? `${s.width}×${s.height}  ${kb(s.bytes)}` : '?'}  ${img.decision}${img.reason ? ` (${img.reason})` : ''}${img.duplicate_of ? ` — the same file as ${img.duplicate_of}` : ''}`);
+  }
+  for (const [k, group] of pages(all).entries()) {
+    const f = `sheets/${p.key}-all-${k + 1}.jpg`;
+    writeFileSync(join(DIR, f), drawSheet(group));
+    files.push(f);
+  }
+  legend.push('', `the kept photos as uploaded, in gallery order (sheets …-kept-N.jpg), ${target.width}×${target.height}:`);
+  const keptTiles = [];
+  for (const [k, img] of galleryOrder(p).entries()) {
+    keptTiles.push({ img: img.final?.file ? await read(img.final.file) : null, n: k + 1, frame: 'keep' });
+    legend.push(`  ${String(k + 1).padStart(2)}  ${img.final?.file || img.file}  ${img.file === p.featured ? 'featured · ' : ''}${img.values?.length ? `shows ${img.values.join(', ')} · ` : ''}alt: ${img.alt || '—'}`);
+  }
+  const kept = [];
+  for (const [k, group] of pages(keptTiles).entries()) {
+    const f = `sheets/${p.key}-kept-${k + 1}.jpg`;
+    writeFileSync(join(DIR, f), drawSheet(group));
+    kept.push(f);
+  }
+  writeFileSync(join(dir, `${p.key}.txt`), legend.join('\n') + '\n');
+  p.kept_sheet = { files: kept, fingerprint: keptFingerprint(p, target.key), drawn_at: new Date().toISOString() };
+  return [...files, ...kept];
 }
 
 function count(t, f) {

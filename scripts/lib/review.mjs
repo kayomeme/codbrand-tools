@@ -26,7 +26,7 @@ export function reviewHtml(plan, sources) {
       return `
       <figure class="${esc(i.decision)}${i.final?.edge === 'scene' ? ' scene' : ''}">
         ${shown ? `<img src="${esc(shown)}" loading="lazy" alt="">` : '<div class="missing">not downloaded</div>'}
-        <figcaption><b>${esc(i.file || '—')}</b><br>${esc(i.roles.join(' + '))}${i.values?.length ? ` · ${esc(i.values.join(', '))}` : ''}<br>
+        <figcaption><b>${esc(i.file || '—')}</b><br>${esc(i.roles.join(' + '))}${i.values?.length ? ` · ${esc(i.values.join(', '))}` : ''}${i.duplicate_of ? `<br><span class="small">the same file as ${esc(i.duplicate_of)}</span>` : ''}<br>
         ${i.shrink ? `${kb(i.shrink.from.bytes)} ${i.shrink.from.width}×${i.shrink.from.height} → ${kb(i.shrink.to.bytes)} ${i.shrink.to.width}×${i.shrink.to.height} (${esc(i.shrink.engine)})` : esc(i.error || '')}${small}${made}<br>
         <span class="dec">${esc(i.decision)}${i.reason ? ` — ${esc(i.reason)}` : ''}</span></figcaption>
       </figure>`;
@@ -38,6 +38,7 @@ export function reviewHtml(plan, sources) {
       <p class="meta">${esc(PLATFORM[s.platform] || s.platform)} · ${esc(s.pid)}${s.product_sku ? ` · SKU ${esc(s.product_sku)}` : ''} · ${esc(ROUTE[s.route] || s.route)}${s.url ? ` · <a href="${esc(s.url)}">source page</a>` : ''}</p>
       ${s.supplier ? '' : '<p class="warn">A retailer\'s own content — use it only if the merchant confirms they may (rights_confirmed).</p>'}
       ${s.facts.moq > 1 ? `<p class="warn">Minimum order on the source: ${esc(s.facts.moq)}.</p>` : ''}
+      ${s.facts.notes?.length ? `<p class="warn">The source's caveats — the copy must carry them:</p><ul>${s.facts.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
       <p class="meta">${esc(s.facts.category_path.join(' › '))}${s.facts.brand ? ` · brand: ${esc(s.facts.brand)}` : ''}${s.facts.material.length ? ` · material: ${esc(s.facts.material.join(', '))}` : ''}</p>
       <p class="meta">${s.options.map((o) => `${esc(o.name)}: ${esc(o.values.join(', '))}`).join('<br>')}</p>
       <p class="cost">Source ${s.price.kind === 'cost' ? 'cost' : 'price'} ${esc(s.price.min)}${s.price.max != null && s.price.max !== s.price.min ? `–${esc(s.price.max)}` : ''} ${esc(s.price.currency || '')} — reference for pricing, never shown to shoppers</p>

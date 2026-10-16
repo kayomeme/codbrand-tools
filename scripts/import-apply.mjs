@@ -2,11 +2,17 @@
 /**
  * import-apply.mjs — step 4 of a product import: write the reviewed plan into the store, as DRAFTS.
  *
- *   node import-apply.mjs <site-url> <api-key> [--plan product-import/plan.json] [--dry-run] [--publish]
+ *   node import-apply.mjs <site-url> --key-file <key file> [--plan product-import/plan.json] [--only <key,…>]
+ *                         [--dry-run] [--publish]
  *
+ *   --key-file  a file holding the store's API key (one line CL_API_KEY=…); or set CL_API_KEY. The key is
+ *               REFUSED on the command line: it would stay in the shell's history and the conversation.
+ *   --only      only these products (their plan keys, comma-separated) — for any run, --publish included.
  *   --dry-run   every check, every read, and the list of writes it WOULD make. Writes nothing.
- *   --publish   after writing, publish each product and send its variations again (the shop's filter
- *               only counts options on published products, and publishing alone does not refresh it).
+ *   --publish   STATUS ONLY: publishes products this import already wrote, and sends each one's own current
+ *               variations back (the shop's filter counts options on published products only, and publishing
+ *               alone does not refresh it). It writes nothing else — a fix made in wp-admin during the draft
+ *               review stays.
  *
  * It REFUSES, before the first write, while any of these holds (all are listed at once):
  *   rights    a product from a retailer's own store (not a supplier platform) lacks rights_confirmed: true
@@ -33,19 +39,21 @@
 import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import { createHash } from 'node:crypto';
-import { clapi } from './lib/clapi.mjs';
-import { checkPlan, pricesFor, productBody, variationsBody, storeVariants, activeIdx, slugify, targetOf, libraryIssues, boxRatio } from './lib/plan.mjs';
+import { clapi, storeAccess } from './lib/clapi.mjs';
+import { checkPlan, pricesFor, productBody, variationsBody, storeVariants, activeIdx, slugify, targetOf, libraryIssues, boxRatio, photoLinks, asReplaceRow } from './lib/plan.mjs';
 import { MAX_BYTES } from './lib/images.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
 const opt = (n) => { const i = argv.indexOf(n); return i !== -1 ? argv[i + 1] : null; };
-const positional = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--plan');
-const [SITE, KEY] = positional;
+const WITH_VALUE = ['--plan', '--key-file', '--only'];
+const positional = argv.filter((a, i) => !a.startsWith('--') && !WITH_VALUE.includes(argv[i - 1]));
 const PLAN = resolve(opt('--plan') || join('product-import', 'plan.json'));
 const DIR = dirname(PLAN);
 const DRY = flag('--dry-run');
 const PUBLISH = flag('--publish');
+const ONLY = opt('--only') ? new Set(opt('--only').split(',').map((s) => s.trim()).filter(Boolean)) : null;
+const USAGE = 'usage: node import-apply.mjs <site-url> --key-file <key file> [--plan product-import/plan.json] [--only <key,…>] [--dry-run] [--publish]';
 
 const NEEDED = ['products', 'media', 'categories', 'global_variations', 'product_variations', 'product_variants'];
 const sha = (b) => createHash('sha256').update(b).digest('hex');
@@ -53,11 +61,18 @@ const short = (s) => createHash('sha1').update(s).digest('hex').slice(0, 12);
 const say = (s = '') => console.log(s);
 
 async function main() {
-  if (!SITE || !KEY) { console.error('usage: node import-apply.mjs <site-url> <api-key> [--plan product-import/plan.json] [--dry-run] [--publish]'); return 1; }
+  const access = storeAccess({ positional, keyFile: opt('--key-file'), readFile: (f) => readFileSync(f, 'utf8') });
+  if (access.error) { console.error(`✗ ${access.error}\n${USAGE}`); return 1; }
   if (!existsSync(PLAN)) { console.error(`✗ no plan at ${PLAN} — run import-fetch.mjs first`); return 1; }
-  const plan = JSON.parse(readFileSync(PLAN, 'utf8'));
+  const fullPlan = JSON.parse(readFileSync(PLAN, 'utf8'));
+  if (ONLY) {
+    const unknown = [...ONLY].filter((k) => !(fullPlan.products || []).some((p) => p.key === k));
+    if (unknown.length) { console.error(`✗ --only: no product ${unknown.join(', ')} in the plan — its keys are: ${(fullPlan.products || []).map((p) => p.key).join(', ')}`); return 1; }
+  }
+  // the products this run acts on; the plan file itself is never rewritten here
+  const plan = { ...fullPlan, products: (fullPlan.products || []).filter((p) => !ONLY || ONLY.has(p.key)) };
   const sources = {};
-  for (const p of plan.products || []) {
+  for (const p of plan.products) {
     const f = join(DIR, p.source_file || `source/${p.key}.json`);
     if (existsSync(f)) sources[p.key] = JSON.parse(readFileSync(f, 'utf8'));
   }
@@ -65,21 +80,23 @@ async function main() {
   const record = existsSync(recordPath) ? JSON.parse(readFileSync(recordPath, 'utf8'))
     : { kind: 'import-record/1', site: null, products: {}, media: {} };
   const saveRecord = () => { if (!DRY) writeFileSync(recordPath, JSON.stringify(record, null, 2) + '\n'); };
+  const api = clapi(access.site, access.key);
+  const site = api.base.replace(/\/wp-json.*$/, '');
+  record.site = record.site || site;
+  if (record.site !== site) { console.error(`✗ record.json belongs to ${record.site}, not this store — use a separate import folder per store`); return 1; }
+  if (PUBLISH) return publishOnly(api, plan, record, saveRecord, site);
 
   // ── 1. the plan's own gates — no network ──
   const fileBytes = (f) => { try { return statSync(join(DIR, f)).size; } catch { return null; } };
-  const errors = checkPlan(plan, sources, { fileBytes, maxBytes: MAX_BYTES });
+  const errors = checkPlan(plan, sources, { fileBytes, maxBytes: MAX_BYTES, uploaded: (h) => Boolean(record.media?.[h]) });
 
   // ── 2. the store's gates — reads only ──
-  const api = clapi(SITE, KEY);
-  const site = api.base.replace(/\/wp-json.*$/, '');
-  record.site = record.site || site;
-  if (record.site !== site) errors.push({ key: null, gate: 'door', message: `record.json belongs to ${record.site}, not this store — use a separate import folder per store` });
   const path = {};
   const catExists = {};
   const warnings = [];
+  const activePlan = { ...plan, products: plan.products.filter((p) => !p.skip) };
   try {
-    await storeGates(api, plan, record, path, catExists, errors, warnings);
+    await storeGates(api, activePlan, record, path, catExists, errors, warnings);
   } catch (e) {
     errors.push({ key: null, gate: 'door', message: `${e.message} — the store's own checks could not run` });
   }
@@ -92,33 +109,45 @@ async function main() {
   }
   // media the products used before this run — to name the ones a re-import leaves unused (never deleted)
   const usedBefore = mediaInUse(record);
+  const totals = { created: 0, updated: 0, skipped: 0, photosUploaded: 0, photosReused: 0, kept: 0, candidates: 0, categories: 0, types: 0, options: 0, combinations: 0, readBackFailed: 0 };
 
   // ── 3. the writes ──
   say(`import-apply ${DRY ? '(DRY RUN — nothing is written)' : ''} → ${record.site}\n`);
   const gvCache = {};
   for (const p of plan.products) {
+    if (p.skip) {
+      totals.skipped++;
+      const was = record.products[p.key]?.product_id;
+      say(`• [${p.key}] skipped — ${p.skip_reason}${was ? ` (product ${was}, imported before, stays in the store as it is: set it to draft or delete it in wp-admin if it must go)` : ''}`);
+      continue;
+    }
     const src = sources[p.key];
     const rec = record.products[p.key] || { source: { platform: src.platform, product_id: src.pid, product_sku: src.product_sku, url: src.url, route: src.route }, images: [] };
     const prices = pricesFor(p, src, plan.pricing || {});
     say(`• ${p.copy.title}  [${p.key}]`);
 
     // images — what is uploaded is the file import-photos.mjs made (one format, ratio and size); the plan's gates
-    // refused any kept photo without one
+    // refused any kept photo without one. A file already in the store (record.json, by its hash) is not read
+    // again, so a re-run does not need images/ for photos uploaded before.
     const kept = p.images.filter((i) => i.decision === 'keep');
+    totals.kept += kept.length;
+    totals.candidates += p.images.filter((i) => i.file).length;
     const mediaFor = {};   // file -> media id
     const mediaUrl = {};   // file -> media URL (a photo swatch is drawn from its URL, not its id)
     let already = 0;
     const entries = [];
     for (const [n, img] of kept.entries()) {
-      const bytes = readFileSync(join(DIR, img.final.file));
-      const hash = sha(bytes);
+      const known = img.final.sha256 && record.media[img.final.sha256];
+      const bytes = known ? null : readFileSync(join(DIR, img.final.file));
+      const hash = known ? img.final.sha256 : sha(bytes);
       let m = record.media[hash];
-      if (m) already++;
+      if (m) { already++; totals.photosReused++; }
       if (!m && !DRY) {
         const body = { filename: `${p.copy.slug || slugify(p.copy.title)}-${String(n + 1).padStart(2, '0')}.jpg`, data_base64: bytes.toString('base64'), alt: img.alt, title: img.alt };
         const row = await api.post(path.media, body, `import-media-${hash.slice(0, 32)}`);
         m = record.media[hash] = { id: row.id, url: row.url };
-      }
+        totals.photosUploaded++;
+      } else if (!m) totals.photosUploaded++;
       mediaFor[img.file] = m?.id ?? `(new ${basename(img.file)})`;
       mediaUrl[img.file] = m?.url ?? null;
       entries.push({ file: img.file, uploaded: img.final.file, sha256: hash, media_id: m?.id ?? null, url: m?.url ?? null,
@@ -132,12 +161,18 @@ async function main() {
     say(`    images: ${kept.length} kept (${already} already in the store's library)${replaced ? `; replaces ${replaced} photo(s) of the last import, which stay in the library` : ''}`);
     say(`    photos: ${photoLine(kept)}`);
 
-    // categories
+    // categories — created once: a later product naming the same one reuses it. An image is one of this
+    // product's kept photos (its upload is reused); a description is plain text (the store strips other tags).
     for (const c of p.category?.create || []) {
       if (catExists[c.slug]) continue;
-      say(`    category: create "${c.name}" (${c.slug})`);
-      if (!DRY) await api.post(path.categories, { name: c.name, slug: c.slug, ...(c.parent_slug ? { parent_slug: c.parent_slug } : {}) }, `import-cat-${c.slug}`);
+      const img = c.image ? mediaFor[c.image] : null;
+      say(`    category: create "${c.name}" (${c.slug})${c.description ? ', with a description' : ''}${img ? `, image ${basename(c.image)}` : ''}`);
+      if (!DRY) {
+        await api.post(path.categories, { name: c.name, slug: c.slug, ...(c.parent_slug ? { parent_slug: c.parent_slug } : {}),
+          ...(c.description ? { description: String(c.description) } : {}), ...(Number.isInteger(img) ? { img_id: img } : {}) }, `import-cat-${c.slug}`);
+      }
       catExists[c.slug] = true;
+      totals.categories++;
     }
 
     // the variation library — only for the options that stay
@@ -157,6 +192,7 @@ async function main() {
           gv = DRY ? { id: `(new ${g.slug})`, options: [] }
             : await api.post(path.global_variations, { slug: g.slug, title_in_product: g.title_in_product, type: g.type, is_required: 'yes', error_msg: String(g.error_msg).trim() }, `import-gv-${g.slug}`);
           gv.options = gv.options || [];
+          totals.types++;
         }
         gvCache[g.slug] = gv;
       }
@@ -167,6 +203,7 @@ async function main() {
         let found = gv.options.find((x) => String(x.title).trim().toLowerCase() === title.toLowerCase());
         if (!found) {
           say(`    option: add "${title}" to ${g.slug}`);
+          totals.options++;
           if (DRY) { found = { id: `(new ${title})`, title }; gv.options.push(found); }
           else {
             const after = await api.post(`${path.global_variations}/${gv.id}/options`, { title, ...(v.color_code ? { color_code: v.color_code } : {}) }, `import-gvo-${g.slug}-${short(title)}`);
@@ -174,6 +211,9 @@ async function main() {
             found = gv.options.find((x) => String(x.title).trim().toLowerCase() === title.toLowerCase());
             if (!found) throw new Error(`the store did not return option "${title}" after adding it to ${g.slug}`);
           }
+        } else if (g.type === 'colorbox' && v.color_code && found.color_code && String(found.color_code).toLowerCase() !== String(v.color_code).toLowerCase()) {
+          // reused from the store's library: this product shows its own colour (sent with its variations)
+          say(`    option: reuse "${title}" — on this product ${v.color_code} (the store's "${title}" is ${found.color_code})`);
         }
         ids.set(v.source_value, found.id);
       }
@@ -186,7 +226,8 @@ async function main() {
     const galleryFiles = [p.featured, ...kept.map((i) => i.file).filter((f) => f !== p.featured)].filter(Boolean);
     const body = productBody(p, src, { prices, featuredId: mediaFor[p.featured], galleryIds: galleryFiles.map((f) => mediaFor[f]), create: !rec.product_id });
     if (rec.product_id) {
-      say(`    product: update ${rec.product_id} — ${body.slug}, ${priceLine(prices)}`);
+      totals.updated++;
+      say(`    product: update ${rec.product_id} — ${body.slug}, ${priceLine(prices)} (its status does not change)`);
       if (!DRY) {
         try { await api.patch(`${path.products}/${rec.product_id}`, body); }
         catch (e) {
@@ -195,6 +236,7 @@ async function main() {
         }
       }
     } else {
+      totals.created++;
       say(`    product: create draft — ${body.slug}, ${priceLine(prices)}`);
       if (!DRY) {
         const row = await api.post(path.products, body, `import-product-${p.key}-${short(JSON.stringify(body))}`);
@@ -209,11 +251,12 @@ async function main() {
 
     // its variations and priced combinations
     const active = activeIdx(p);
+    let chosen = [];
     if (active.length) {
       const media = Object.fromEntries(Object.keys(mediaFor).map((f) => [f, { id: mediaFor[f], url: mediaUrl[f] }]));
       const variations = variationsBody(p, productId, { gvIds, optionIds, media });
       const byVid = new Map((prices.variants || []).map((v) => [v.vid, v]));
-      const chosen = storeVariants(p);
+      chosen = storeVariants(p);
       const variants = {
         product_id: productId,
         variants: chosen.map((v) => {
@@ -223,7 +266,23 @@ async function main() {
             ...(v.sku ? { sku: v.sku } : {}) };
         }),
       };
+      totals.combinations += variants.variants.length;
       say(`    variations: ${active.map((oi) => `${p.options[oi].global_variation.slug} × ${p.options[oi].values.filter((x) => x.include !== false).length}`).join(', ')}; ${variants.variants.length} combination(s)`);
+      for (const o of p.options.filter((x) => x.drop && x.values.length > 1)) say(`    dropped "${o.source_name}": the store sells "${o.keep_value}" only`);
+      // every combination with the SKU the supplier is ordered by and the source's cost behind its price — a wrong
+      // pick (the wrong set, a dearer variant) shows here before anything is written
+      if (DRY) {
+        const costOf = new Map(src.variants.map((v) => [v.vid, v.price]));
+        for (const v of chosen) {
+          const label = active.map((oi) => p.options[oi].values.find((x) => x.source_value === v.source_values[oi])?.title || v.source_values[oi]).join(' / ');
+          say(`      ${label}  ·  SKU ${v.sku || '—'}  ·  source ${costOf.get(v.vid) ?? '?'} ${src.price?.currency || ''}  ·  sells at ${byVid.get(v.vid)?.pays ?? prices.sale_price ?? prices.regular_price}`);
+        }
+      }
+      // which photo each value of the photo option switches to — the ones the tool linked are for a person to check
+      for (const l of photoLinks(p)) {
+        if (!l.image) say(`    ! ${l.option} "${l.title || l.value}" has no photo of its own: picking it keeps the photo on show`);
+        else if (l.how === 'inferred') say(`    ${l.option} "${l.title || l.value}" → ${basename(l.image.file)} (linked by the tool — check it on the kept sheet)`);
+      }
       if (!DRY) {
         await api.post(path.product_variations, variations);
         await api.post(path.product_variants, variants);
@@ -232,26 +291,80 @@ async function main() {
       }
     }
 
-    // publish
-    if (PUBLISH) {
-      say('    publish: status → publish, variations re-sent for the shop filter');
-      if (!DRY) {
-        await api.patch(`${path.products}/${productId}`, { status: 'publish' });
-        if (rec.variations_body) await api.post(path.product_variations, rec.variations_body);
-        rec.status = 'publish';
-      }
+    // read it back: what the store now holds, and where to look at it
+    if (!DRY) {
+      const back = await api.get(`${path.products}/${productId}`);
+      const gallery = Array.isArray(back.gallery_image_ids) ? back.gallery_image_ids.map(String) : [];
+      const sent = (body.gallery_image_ids || []).map(String);
+      const combos = active.length ? await api.get(path.product_variants, { product_id: productId }) : [];
+      const problems = [];
+      // the store answers sale_price 0 for "no sale" (measured on dev1)
+      const saleBack = Number(back.sale_price) > 0 ? Number(back.sale_price) : null;
+      const saleSent = body.sale_price != null ? Number(body.sale_price) : null;
+      if (Number(back.regular_price) !== Number(body.regular_price)) problems.push(`price ${back.regular_price}, sent ${body.regular_price}`);
+      if (saleBack !== saleSent) problems.push(`sale price ${saleBack ?? 'none'}, sent ${saleSent ?? 'none'}`);
+      if (gallery.join() !== sent.join()) problems.push(`gallery ${gallery.length} photo(s), sent ${sent.length}`);
+      if (active.length && (Array.isArray(combos) ? combos.length : 0) !== chosen.length) problems.push(`${Array.isArray(combos) ? combos.length : '?'} combination(s), sent ${chosen.length}`);
+      if (problems.length) totals.readBackFailed++;
+      say(`    read back: ${back.status}, ${saleBack != null ? `${saleBack} (was ${back.regular_price})` : back.regular_price}, ${gallery.length} photo(s)${active.length ? `, ${chosen.length} combination(s)` : ''} ${problems.length ? `✗ ${problems.join('; ')}` : '✓'}`);
+      say(`    look at it: ${back.url || `${site}/?post_type=product&p=${productId}&preview=true`}${back.url ? '' : '  (a draft: open it signed in to the store\'s admin)'}`);
+      rec.status = back.status || rec.status;
     }
     rec.updated_at = new Date().toISOString();
     if (!DRY) { record.products[p.key] = rec; saveRecord(); }
   }
-  say(DRY ? '\nDRY RUN: all checks pass; a real run would make exactly the writes above.' : `\nDone. record.json: ${recordPath}`);
-  if (!DRY) {
-    const inUse = mediaInUse(record);
-    const unused = [...usedBefore].filter((id) => !inUse.has(id));
-    if (unused.length) say(`${unused.length} photo(s) these products used before are no longer in them (media ids ${unused.join(', ')}). The import deletes nothing: remove them in the store's media library if nothing else uses them.`);
+
+  say(`\n${DRY ? 'DRY RUN — would write' : 'Written'}: ${totals.created} product(s) created as drafts, ${totals.updated} updated (status unchanged), ${totals.skipped} skipped · photos: ${totals.kept} kept of ${totals.candidates} candidates, ${totals.photosUploaded} ${DRY ? 'to upload' : 'uploaded'}, ${totals.photosReused} already in the store · ${totals.categories} categor${totals.categories === 1 ? 'y' : 'ies'}, ${totals.types} variation type(s) and ${totals.options} option(s) created · ${totals.combinations} combination(s)`);
+  if (DRY) { say('DRY RUN: all checks pass; a real run would make exactly the writes above.'); return 0; }
+  say(`record.json: ${recordPath}`);
+  if (totals.readBackFailed) say(`✗ ${totals.readBackFailed} product(s) read back different from what was sent — see "read back" above.`);
+  const inUse = mediaInUse(record);
+  const unused = [...usedBefore].filter((id) => !inUse.has(id));
+  if (unused.length) say(`${unused.length} photo(s) these products used before are no longer in them (media ids ${unused.join(', ')}). The import deletes nothing: remove them in the store's media library if nothing else uses them.`);
+  if (totals.created) say(`The ${totals.created} new product(s) are DRAFTS: look at each one (links above), then publish them with --publish${ONLY ? '' : ' (add --only <key,…> for some of them)'}.`);
+  return totals.readBackFailed ? 1 : 0;
+}
+
+/**
+ * --publish: STATUS ONLY. Publishes the products this import already wrote (record.json), and sends each one's own
+ * CURRENT variations back as they are — the shop's filter counts options only on published products and publishing
+ * alone does not refresh it. Nothing else is written, so a fix the merchant made in wp-admin during the draft review
+ * stays (before, --publish re-applied the whole plan over it).
+ */
+async function publishOnly(api, plan, record, saveRecord, site) {
+  const me = await api.get('me');
+  const res = me.resources || {};
+  const path = {};
+  const missing = [];
+  for (const slug of ['products', 'product_variations']) {
+    if (!(res[slug]?.scopes || []).includes('write')) missing.push(slug);
+    path[slug] = String(res[slug]?.path || slug.replace(/^product_/, 'product/'));
   }
-  if (!DRY && !PUBLISH) say('The products are DRAFTS. Look at each one in the store, then run again with --publish.');
-  return 0;
+  if (missing.length) { say(`import-apply --publish: REFUSED — this key cannot write ${missing.join(' + ')}`); return 1; }
+  say(`import-apply --publish ${DRY ? '(DRY RUN — nothing is written) ' : ''}→ ${record.site} — status only: nothing else is written\n`);
+  const notYet = [];
+  let published = 0;
+  for (const p of plan.products) {
+    if (p.skip) { say(`• [${p.key}] skipped — ${p.skip_reason}`); continue; }
+    const rec = record.products[p.key];
+    if (!rec?.product_id) { notYet.push(p.key); continue; }
+    say(`• ${p.copy?.title || p.key}  [${p.key}] → product ${rec.product_id}`);
+    if (DRY) { published++; continue; }
+    await api.patch(`${path.products}/${rec.product_id}`, { status: 'publish' });
+    const current = await api.get(path.product_variations, { product_id: rec.product_id });
+    const rows = Array.isArray(current) ? current : current?.items || [];
+    if (rows.length) await api.post(path.product_variations, { product_id: rec.product_id, variations: rows.map(asReplaceRow) });
+    const back = await api.get(`${path.products}/${rec.product_id}`);
+    rec.status = back.status;
+    rec.published_at = new Date().toISOString();
+    record.products[p.key] = rec;
+    saveRecord();
+    published++;
+    say(`    ${back.status === 'publish' ? '✓ published' : `✗ the store says "${back.status}"`}${rows.length ? ', its own variations sent back for the shop filter' : ''}: ${back.url || `${site}/?post_type=product&p=${rec.product_id}`}`);
+  }
+  if (notYet.length) say(`\nNot imported yet (run without --publish first): ${notYet.join(', ')}`);
+  say(`\n${DRY ? 'DRY RUN — would publish' : 'Published'}: ${published} product(s).`);
+  return notYet.length ? 1 : 0;
 }
 
 const priceLine = (pr) => pr.sale_price != null ? `${pr.sale_price} (was ${pr.regular_price})` : `${pr.regular_price}`;
@@ -352,7 +465,7 @@ async function listingRatioCheck(api, plan, res, warnings) {
 const SENDS = [
   ['post', 'products', ['title', 'slug', 'status', 'category_slugs', 'regular_price', 'sale_price', 'sku', 'featured_image_id', 'gallery_image_ids', 'short_description', 'long_description', 'extra_description']],
   ['post', 'media', ['filename', 'data_base64', 'alt', 'title']],
-  ['post', 'categories', ['name', 'slug', 'parent_slug']],
+  ['post', 'categories', ['name', 'slug', 'parent_slug', 'description', 'img_id']],
   ['post', 'global_variations', ['slug', 'title_in_product', 'type', 'is_required', 'error_msg']],
   ['post', 'product_variations', ['product_id', 'variations']],
   ['post', 'product_variants', ['product_id', 'variants']],

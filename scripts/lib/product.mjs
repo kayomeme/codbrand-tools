@@ -7,13 +7,21 @@
 //     schema: 'product/1', platform, route: 'api' | 'fetch' | 'page', supplier: true | false,
 //     pid, product_sku, url, fetched_at,
 //     facts:  { title, description_text, description_html, category_path[], specs[{name,value}], material[],
-//               packing[], properties[], weight_g, hs_code, brand, moq },     <- for the REWRITE, never as-is
+//               packing[], properties[], weight_g, hs_code, brand, moq,
+//               notes[] },                                                   <- for the REWRITE, never as-is
 //     price:  { kind: 'cost' | 'retail', currency, min, max },              <- reference only, never a price
 //     options: [{ name, values[] }],
 //     image_option: <option whose value decides the photo> | null,
 //     variants: [{ vid, sku, key, values[] | null, price, image, ambiguous, candidates? }],
-//     images:   [{ url, roles[] ('main'|'gallery'|'variant'|'description'), values[] }]
+//     images:   [{ url, roles[] ('main'|'gallery'|'variant'|'description'), values[], combos[][] }]
 //   }
+//
+// `facts.notes` are the description's caveats — what is NOT in the parcel, what IS, sizing warnings, "please
+// note" — lifted out because a copy that drops one ("coaster only, cup not included") promises something the
+// parcel does not hold, and a cash-on-delivery customer refuses it at the door.
+// `combos` on a variant photo: every combination of values it was given for. When two options change the photo
+// (a colour AND a blade count), no single option decides it and `image_option` is null — the plan still links
+// each colour to a photo through these.
 //
 // `supplier` is true for platforms whose photos and descriptions are provided for reselling their products
 // (CJdropshipping, AliExpress, Alibaba). Anything else — a brand's or another retailer's own store — is not,
@@ -75,6 +83,46 @@ export function htmlToText(html) {
     .replace(/ *\n */g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+// The caveats worth carrying into the copy, in English and French (AliExpress answers in the visitor's language).
+// Accents are stripped before matching, so "séparément" is matched as "separement".
+const NOTE_PATTERNS = [
+  /\bnot (be )?included\b/, /\b(do|does|did)(n'?t| not) (include|come with|contain)\b/, /\bexclud(e|es|ed|ing)\b/,
+  /\bsold separately\b/, /\b[\w-]+ only\s*[,.;!)]/, /\bonly\b.*\b(includ|contain|sold|ship|come|send)/,
+  /\b(package|packing|parcel) (include|includes|included|content|contents|list)\b/, /\bin the (box|package)\b/,
+  /\b(please|kindly) (note|allow)\b/, /^\s*(note|notice|n\.?\s?b\.?|warm tips?|tips?)\s*[:：]/,
+  /\basian siz/, /\bsizes? (is|are|run|runs) (a bit |slightly )?(small|smaller|large|larger)\b/,
+  /\b(choose|select|order|take|buy) (a |one |the )?(size )?(larger|bigger|smaller|up)\b/,
+  /\b(1|2|one|two|1-2|1 to 2|1 or 2) sizes? (smaller|larger|bigger|up)\b/,
+  /\b(n'?est|ne sont) pas (inclu|fourni)/, /\b(non|pas) (inclu|fourni)/, /\bvendue?s? separement\b/,
+  /\b(uniquement|seulement)\b/, /\b(le )?colis (comprend|contient|inclut)\b/, /\bcontenu du (colis|paquet)\b/,
+  /\b(veuillez|merci de) noter\b/, /\b(a noter|remarque)\s*:?/, /\btaille (asiatique|petite)\b/, /\btaille au-dessus\b/,
+];
+
+/**
+ * The description's caveats, each as the source wrote it (at most 12, each at most 240 characters). A heading
+ * on its own ("Note:", "Packing list:") takes the line after it, which is where its content is.
+ */
+export function extractNotes(text) {
+  const plain = (s) => s.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const pieces = String(text ?? '').split(/\n+|(?<=[.!?。])\s+/).map((p) => p.trim()).filter(Boolean);
+  const isNote = (s) => s.length >= 4 && s.length <= 400 && NOTE_PATTERNS.some((re) => re.test(plain(s)));
+  const out = [];
+  for (let i = 0; i < pieces.length && out.length < 12; i++) {
+    let s = pieces[i];
+    if (!isNote(s)) continue;
+    if (/[:：]$/.test(s) && s.length <= 40) {
+      let j = i + 1;
+      while (pieces[j] && /^\d+[.)]?$/.test(pieces[j])) j++; // "1." of a numbered list
+      if (!pieces[j] || isNote(pieces[j])) continue;         // the line after is a note of its own
+      s = `${s} ${pieces[j]}`;
+      i = j;
+    }
+    s = s.slice(0, 240);
+    if (!out.includes(s)) out.push(s);
+  }
+  return out;
 }
 
 export function descriptionImages(html) {
@@ -195,18 +243,22 @@ export function buildProduct({ platform, route, pid, productSku, url, title, des
   }
 
   const images = [];
-  const add = (u, role, value) => {
+  const add = (u, role, value, combo) => {
     const c = cleanUrl(u, url);
     if (!c) return;
     let img = images.find((x) => x.url === c);
     if (!img) { img = { url: c, roles: [], values: [] }; images.push(img); }
     if (!img.roles.includes(role)) img.roles.push(role);
     if (value && !img.values.includes(value)) img.values.push(value);
+    if (combo) {
+      img.combos = img.combos || [];
+      if (!img.combos.some((x) => x.join('\u0000') === combo.join('\u0000'))) img.combos.push(combo);
+    }
   };
   if (mainImage) add(mainImage, 'main');
   for (const g of gallery) add(g, 'gallery');
   const io = imageOption ? optionNames.indexOf(imageOption) : -1;
-  for (const v of variants) if (v.image) add(v.image, 'variant', io >= 0 && v.values ? v.values[io] : null);
+  for (const v of variants) if (v.image) add(v.image, 'variant', io >= 0 && v.values ? v.values[io] : null, v.values || null);
   for (const d of descriptionImages(descriptionHtml)) add(d, 'description');
 
   const prices = variants.map((v) => v.price).filter((c) => c != null);
@@ -233,6 +285,7 @@ export function buildProduct({ platform, route, pid, productSku, url, title, des
       hs_code: hsCode ? String(hsCode) : null,
       brand: brand ? String(brand) : null,
       moq: moq ? Number(moq) : null,
+      notes: extractNotes(htmlToText(descriptionHtml)),
     },
     price: {
       kind: priceKind || (SUPPLIERS.has(platform) ? 'cost' : 'retail'),

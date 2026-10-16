@@ -7,6 +7,8 @@
 // (for a retailer's content) the merchant's confirmation that they may use it. `checkPlan` refuses until every one is made; that is the point of the
 // file. A rule written only in prose can be skipped; this one cannot.
 
+import { createHash } from 'node:crypto';
+
 export const PLAN_KIND = 'import-plan/1';
 export const GV_TYPES = ['buttons', 'colorbox', 'images', 'selectbox'];
 export const EXCLUDE_REASONS = ['watermark', 'logo', 'person', 'foreign-text', 'duplicate', 'size-chart',
@@ -52,12 +54,29 @@ export function targetOf(photos) {
 }
 
 /**
+ * The option whose values the photos follow when no single option decides every variant photo (a colour AND a
+ * blade count each change it): the one with the most photographed values. null when variants have no photos of
+ * their own, or all share one.
+ */
+export function guessPhotoOption(src) {
+  const withPhoto = (src.variants || []).filter((v) => v.image && Array.isArray(v.values));
+  if (new Set(withPhoto.map((v) => v.image)).size < 2) return null;
+  let best = null, most = 1;
+  (src.options || []).forEach((o, i) => {
+    const n = new Set(withPhoto.map((v) => v.values[i])).size;
+    if (n > most) { most = n; best = o.name; }
+  });
+  return best;
+}
+
+/**
  * The plan entry for one fetched product. `images` are the files import-fetch saved, in source order:
- * [{ file, url, roles, values, shrink: {engine, from, to} | null, error? }]
+ * [{ file, url, roles, values, combos?, shrink: {engine, from, to} | null, duplicate_of?, error? }]
  */
 export function productEntry(src, images) {
-  const main = images.find((i) => i.roles.includes('main') && !i.error) || images.find((i) => !i.error);
+  const main = images.find((i) => i.roles.includes('main') && !i.error && !i.duplicate_of) || images.find((i) => !i.error);
   const key = keyOf(src);
+  const description = (i) => i.roles.every((r) => r === 'description');
   return {
     key,
     platform: src.platform,
@@ -65,19 +84,25 @@ export function productEntry(src, images) {
     source_file: `source/${key}.json`,
     // A retailer's own photos and text are not provided for reselling: the merchant must say they may use them.
     ...(src.supplier ? {} : { rights_confirmed: null }),
+    // The description's caveats (facts.notes) must reach the copy: refused until notes_checked is true.
+    ...(src.facts?.notes?.length ? { notes_checked: null } : {}),
     copy: { language: null, title: null, slug: null, short_description: null, long_description: null, specs_html: null },
     price: { price: null, compare_at: null },
     variant_prices: {},
     category: { slugs: [], create: [] },
     featured: main ? main.file : null,
+    // The option whose values the photos follow — picking one of its values switches to that value's photo.
+    photo_option: src.image_option || guessPhotoOption(src),
     images: images.map((i) => ({
       file: i.file,
       source_url: i.url,
       ...(i.original_url ? { original_url: i.original_url } : {}),
       roles: i.roles,
       values: i.values,
-      decision: i.error ? 'exclude' : i.roles.every((r) => r === 'description') ? 'exclude' : 'unreviewed',
-      reason: i.error ? 'too-large' : i.roles.every((r) => r === 'description') ? 'description-image' : null,
+      ...(i.combos ? { combos: i.combos } : {}),
+      decision: i.error || i.duplicate_of || description(i) ? 'exclude' : 'unreviewed',
+      reason: i.error ? 'too-large' : i.duplicate_of ? 'duplicate' : description(i) ? 'description-image' : null,
+      ...(i.duplicate_of ? { duplicate_of: i.duplicate_of } : {}),
       alt: null,
       shrink: i.shrink || null,
       ...(i.error ? { error: i.error } : {}),
@@ -109,13 +134,17 @@ export function mergePlan(plan, entries) {
     const old = out.products[i];
     e.images = e.images.map((img) => {
       const prev = old.images.find((x) => x.source_url === img.source_url);
-      // the photos step's result stays with the file it was made from (import-photos checks it is still current)
-      return prev ? { ...img, decision: prev.decision, reason: prev.reason, alt: prev.alt,
+      // the photos step's result stays with the file it was made from (import-photos checks it is still current);
+      // a photo's `values` set in the plan stay too — a re-fetch used to reset them to the source's, which
+      // unlinked a clean shot from the colour it stood in for (measured 30-09-2026)
+      return prev ? { ...img, decision: prev.decision, reason: prev.reason, alt: prev.alt, values: prev.values ?? img.values,
         ...(prev.final && prev.file === img.file ? { final: prev.final } : {}) } : img;
     });
+    const kept = (k) => (k in old ? { [k]: old[k] } : {});
     out.products[i] = { ...e, copy: old.copy, price: old.price, variant_prices: old.variant_prices,
       category: old.category, featured: old.featured ?? e.featured,
-      ...('rights_confirmed' in old ? { rights_confirmed: old.rights_confirmed } : {}),
+      ...kept('rights_confirmed'), ...kept('notes_checked'), ...kept('skip'), ...kept('skip_reason'), ...kept('kept_sheet'),
+      photo_option: old.photo_option ?? e.photo_option,
       options: e.options.map((o) => old.options.find((x) => x.source_name === o.source_name) ?? o),
       variants: e.variants.map((v) => old.variants.find((x) => x.vid === v.vid) ?? v) };
   }
@@ -156,15 +185,21 @@ export const included = (p, v) => activeIdx(p).every((i) =>
   p.options[i].values.find((x) => x.source_value === v.source_values?.[i])?.include !== false);
 
 /**
- * The variants the store gets: resolved, included, one per combination of the options that stay. Dropping
- * an option with several values ("Ships from") can leave two variants with the same combination; the first
- * one is kept.
+ * The variants the store gets: resolved, included, one per combination of the options that stay.
+ *
+ * A dropped option with several values ("Blades": 4 or 6; "Set": 3 pieces or 5) must name the ONE value the store
+ * sells, `keep_value`: only that value's variants are kept, so each combination carries the right SKU and cost.
+ * Without it the first variant used to be kept silently — measured on a real import: a knife holder sold its
+ * 3-piece set, cost 162, for 149. `checkPlan` refuses a drop without it; here a missing one still falls back to
+ * the first variant so that a dry run can show what would happen.
  */
 export function storeVariants(p) {
+  const pinned = p.options.map((o, i) => (o.drop && o.values.length > 1 && o.keep_value != null ? [i, o.keep_value] : null)).filter(Boolean);
   const seen = new Set();
   const out = [];
   for (const v of p.variants) {
     if (!Array.isArray(v.source_values) || !included(p, v)) continue;
+    if (pinned.some(([i, keep]) => v.source_values[i] !== keep)) continue;
     const k = activeIdx(p).map((i) => v.source_values[i]).join('\u0000');
     if (seen.has(k)) continue;
     seen.add(k);
@@ -257,7 +292,8 @@ export function pricesFor(p, src, pricing = {}) {
 // ── the gates ─────────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Every refusal, before any write. `ctx.fileBytes(file)` returns the size of a saved image or null.
+ * Every refusal, before any write. `ctx.fileBytes(file)` returns the size of a saved image or null;
+ * `ctx.uploaded(sha256)` says whether record.json already has that file in the store (then it need not be on disk).
  * -> [{ key, gate, message }]   (empty = safe to apply)
  */
 export function checkPlan(plan, sources, ctx = {}) {
@@ -269,6 +305,11 @@ export function checkPlan(plan, sources, ctx = {}) {
   if (target.error) err(null, 'photos', `${target.error}; then run import-photos.mjs`);
 
   for (const p of plan.products) {
+    // SKIP — a fetched product the merchant does not want: nothing is checked or written for it
+    if (p.skip) {
+      if (!String(p.skip_reason ?? '').trim()) err(p.key, 'plan', 'skip: true needs a skip_reason — why this product is left out');
+      continue;
+    }
     const src = sources[p.key];
     if (!src) { err(p.key, 'plan', `no fetched source for ${p.key} (${p.source_file})`); continue; }
 
@@ -292,6 +333,10 @@ export function checkPlan(plan, sources, ctx = {}) {
     }
     const slug = c.slug || slugify(c.title);
     if (c.title && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) err(p.key, 'copy', `copy.slug "${slug}" — set a slug of a-z, 0-9 and "-" (a title in another script needs one written)`);
+    // The description's caveats: a copy without "cup not included" promises a cup, and the parcel is refused.
+    if (src.facts?.notes?.length && p.notes_checked !== true) {
+      err(p.key, 'copy', `the source says: ${src.facts.notes.map((n) => `"${n}"`).join(' · ')} — the copy must tell the shopper what is (and is not) in the parcel and any sizing warning, and promise nothing these contradict; then set notes_checked: true`);
+    }
 
     // IMAGES
     const unreviewed = p.images.filter((i) => !['keep', 'exclude'].includes(i.decision));
@@ -302,7 +347,9 @@ export function checkPlan(plan, sources, ctx = {}) {
       if (i.error) err(p.key, 'images', `${i.file || i.source_url}: cannot be kept — ${i.error}`);
       if (!i.alt || !String(i.alt).trim()) err(p.key, 'images', `${i.file}: kept without alt text — describe it in the store's language`);
       const bytes = ctx.fileBytes ? ctx.fileBytes(i.file) : null;
-      if (ctx.fileBytes && bytes == null) err(p.key, 'images', `${i.file}: file missing`);
+      // a photo already made and in the store needs neither file on disk (a re-run after images/ was cleared)
+      const inStore = i.final?.sha256 && ctx.uploaded?.(i.final.sha256);
+      if (ctx.fileBytes && bytes == null && !inStore) err(p.key, 'images', `${i.file}: file missing`);
       if (bytes != null && bytes > maxBytes) err(p.key, 'images', `${i.file}: ${Math.round(bytes / 1024)} KB is over the ${Math.round(maxBytes / 1024)} KB ceiling`);
     }
     const kept = p.images.filter((i) => i.decision === 'keep');
@@ -315,12 +362,22 @@ export function checkPlan(plan, sources, ctx = {}) {
       if (notMade.length) err(p.key, 'photos', `${notMade.length} kept photo(s) not made at ${target.key} yet (${notMade.map((i) => i.file).join(', ')}) — run import-photos.mjs`);
       for (const i of kept.filter((x) => x.final?.target === target.key && x.final?.file)) {
         const bytes = ctx.fileBytes ? ctx.fileBytes(i.final.file) : null;
-        if (ctx.fileBytes && bytes == null) err(p.key, 'photos', `${i.final.file}: file missing — run import-photos.mjs`);
+        const uploaded = i.final.sha256 && ctx.uploaded?.(i.final.sha256);
+        if (ctx.fileBytes && bytes == null && !uploaded) err(p.key, 'photos', `${i.final.file}: file missing — run import-photos.mjs`);
         if (bytes != null && bytes > maxBytes) err(p.key, 'photos', `${i.final.file}: ${Math.round(bytes / 1024)} KB is over the ${Math.round(maxBytes / 1024)} KB ceiling`);
+      }
+      // The kept sheet: the photos exactly as they will be uploaded, drawn as one image an agent can open. It
+      // must have been drawn from THIS kept set — a photo kept, excluded or re-made since makes it stale.
+      if (!notMade.length && kept.length && p.kept_sheet?.fingerprint !== keptFingerprint(p, target.key)) {
+        err(p.key, 'photos', `the kept sheet is missing or older than the kept photos — run import-photos.mjs, then OPEN sheets/${p.key}-kept-1.jpg (and any -kept-2 …) and look at every photo before applying`);
       }
     }
 
-    // VARIANTS
+    // VARIANTS — a dropped option with several values names the one the store sells (see storeVariants)
+    for (const o of p.options) {
+      if (!o.drop || o.values.length < 2 || o.values.some((x) => x.source_value === o.keep_value)) continue;
+      err(p.key, 'variants', `option "${o.source_name}" is dropped but has ${o.values.length} values (${o.values.map((x) => `"${x.source_value}"`).join(', ')}) — set keep_value to the ONE the store sells; each combination then takes that variant's SKU and cost, not the first variant's`);
+    }
     for (const oi of activeIdx(p)) {
       const o = p.options[oi];
       const g = o.global_variation || {};
@@ -346,11 +403,22 @@ export function checkPlan(plan, sources, ctx = {}) {
         if (!p.options[i].values.some((x) => x.source_value === val)) err(p.key, 'variants', `variant ${v.sku || v.vid}: "${val}" is not a value of option "${p.options[i].source_name}"`);
       });
     }
-    if (activeIdx(p).length && !storeVariants(p).length) err(p.key, 'variants', 'every variant is excluded');
+    const sold = storeVariants(p);
+    if (activeIdx(p).length && !sold.length) err(p.key, 'variants', 'every variant is excluded');
+    else if (sold.length) {
+      // a value the store would offer with nothing to sell behind it (e.g. a colour made only with the blade
+      // count that keep_value left out)
+      for (const oi of activeIdx(p)) {
+        for (const v of p.options[oi].values.filter((x) => x.include !== false)) {
+          if (!sold.some((s) => s.source_values[oi] === v.source_value)) err(p.key, 'variants', `option "${p.options[oi].source_name}" value "${v.source_value}" has no variant left to sell — exclude it (include: false), or keep another value of the dropped option`);
+        }
+      }
+    }
 
     // CATEGORY (existence is checked against the store at apply time)
     for (const cc of p.category?.create || []) {
       if (!cc.name || !cc.slug) err(p.key, 'category', 'each category.create entry needs a name and a slug');
+      if (cc.image && !kept.some((i) => i.file === cc.image)) err(p.key, 'category', `category "${cc.slug}": image ${cc.image} is not one of this product's kept photos — name a kept photo's file, or leave image out`);
     }
   }
   return errs;
@@ -393,6 +461,10 @@ export function libraryIssues(plan, store) {
       } else if (!String(existing.error_msg ?? '').trim()) {
         warnings.push(`the store's variation type "${slug}" is required but has no message: a shopper who orders without choosing is stopped without being told why — the merchant can add one in the store's admin (Products → Variations → Edit on "${slug}" → "Error Message")`);
       }
+      // A type's label is the store's, on every product that uses it — the store has no per-product label.
+      if (existing.title_in_product && g.title_in_product && String(existing.title_in_product).trim() !== String(g.title_in_product).trim()) {
+        warnings.push(`the store's type "${slug}" is labelled "${existing.title_in_product}" on every product — your label "${g.title_in_product}" is not used (a type's label cannot be set per product): reuse a type labelled the way you want, or give this option a new slug`);
+      }
     } else if (!String(g.error_msg ?? '').trim()) {
       errors.push({ key, gate: 'variants', message: `variation type "${slug}" will be created, as required: set global_variation.error_msg — what a shopper reads when they order without choosing, in the store's language (e.g. "Choisissez une taille")` });
     }
@@ -407,17 +479,78 @@ export function boxRatio(style) {
 }
 
 /**
- * The kept photo that shows one value of an option (used for image swatches and photo switching). A photo's
- * `values` can be set in the plan: that is how a clean gallery shot replaces a variant photo that had to be
- * excluded (a logo, a watermark). The source's own variant photo wins when both are kept.
+ * The kept photo that shows one value of an option (image swatches and photo switching), and how it was found:
+ *   'set'      — the photo's `values` name the value: the source's own variant photo, or one set in the plan
+ *                (that is how a clean gallery shot replaces a variant photo that had to be excluded). The
+ *                source's variant photo wins when both are kept.
+ *   'inferred' — for the plan's photo_option only, when no photo names the value: a kept variant photo given for
+ *                a combination with that value (`combos`) — the combination the store sells when a dropped
+ *                option has a keep_value, else the first. This is what links each colour to its photo when two
+ *                options change the photo (measured on a real import: 4 products whose colour picks switched
+ *                nothing). The dry run shows these links for a person to check.
  */
-export function valueImage(p, optionIndex, value) {
-  if (!p.options[optionIndex]) return null;
-  const kept = p.images.filter((i) => i.decision === 'keep' && (i.values || []).includes(value));
-  return kept.find((i) => i.roles.includes('variant')) || kept[0] || null;
+export function valueImageHow(p, optionIndex, value) {
+  const o = p.options[optionIndex];
+  if (!o) return null;
+  const kept = p.images.filter((i) => i.decision === 'keep');
+  const named = kept.filter((i) => (i.values || []).includes(value));
+  const pick = named.find((i) => i.roles.includes('variant')) || named[0];
+  if (pick) return { image: pick, how: 'set' };
+  if (o.source_name !== p.photo_option) return null;
+  const pinned = p.options.map((x, i) => (x.drop && x.keep_value != null ? [i, x.keep_value] : null)).filter(Boolean);
+  const shows = kept.filter((i) => (i.combos || []).some((c) => c[optionIndex] === value));
+  const sold = shows.find((i) => i.combos.some((c) => c[optionIndex] === value && pinned.every(([j, k]) => c[j] === k)));
+  const found = sold || shows[0];
+  return found ? { image: found, how: 'inferred' } : null;
 }
+export const valueImage = (p, optionIndex, value) => valueImageHow(p, optionIndex, value)?.image || null;
 export function swatchImage(p, optionIndex, value) {
   return p.options[optionIndex]?.global_variation?.type === 'images' ? valueImage(p, optionIndex, value) : null;
+}
+
+/** Each offered value of the plan's photo_option, its photo and how it was found (image null: none of its own). */
+export function photoLinks(p) {
+  const oi = p.options.findIndex((o) => o.source_name === p.photo_option && !o.drop);
+  if (oi < 0) return [];
+  return p.options[oi].values.filter((v) => v.include !== false).map((v) => {
+    const found = valueImageHow(p, oi, v.source_value);
+    return { option: p.photo_option, value: v.source_value, title: v.title, image: found?.image || null, how: found?.how || null };
+  });
+}
+
+/** The kept photos in gallery order — the featured one first: the order they are uploaded and shown. */
+export function galleryOrder(p) {
+  const kept = p.images.filter((i) => i.decision === 'keep');
+  return [...kept.filter((i) => i.file === p.featured), ...kept.filter((i) => i.file !== p.featured)];
+}
+
+/** What a kept sheet must have been drawn from: the made files, in gallery order, at the photo target. */
+export function keptFingerprint(p, targetKey) {
+  const parts = [targetKey, ...galleryOrder(p).map((i) => `${i.file}=${i.final?.sha256 || ''}`)];
+  return createHash('sha256').update(parts.join('\n')).digest('hex').slice(0, 16);
+}
+
+/**
+ * Photos of one product that are the same file at two URLs (measured on a real import: one product had two such
+ * pairs, shown as duplicate slides). The first keeps the roles, values and combos of both; the other is marked
+ * `duplicate_of` and starts excluded. `hashOf(image)` returns a saved file's hash, or null.
+ */
+export function foldTwins(images, hashOf) {
+  const first = new Map();
+  for (const img of images) {
+    const h = img.file && !img.error ? hashOf(img) : null;
+    if (!h) continue;
+    const twin = first.get(h);
+    if (!twin) { first.set(h, img); continue; }
+    for (const r of img.roles) if (!twin.roles.includes(r)) twin.roles.push(r);
+    for (const v of img.values || []) if (!twin.values.includes(v)) twin.values.push(v);
+    for (const c of img.combos || []) {
+      twin.combos = twin.combos || [];
+      if (!twin.combos.some((x) => x.join('\u0000') === c.join('\u0000'))) twin.combos.push(c);
+    }
+    img.duplicate_of = twin.file;
+  }
+  return images;
 }
 
 // ── what the store is sent ────────────────────────────────────────────────────────────────────────
@@ -429,6 +562,10 @@ export function swatchImage(p, optionIndex, value) {
  * A photo swatch needs BOTH `img_id` and `img_url`: the storefront draws the swatch from img_url and matches the
  * gallery by img_id, and the store does not derive one from the other (measured on dev1: with img_id alone every
  * swatch rendered an empty src). `gallery_img_id` makes picking a value switch the main photo, on any type.
+ *
+ * A colour dot carries the plan's own `color_code` for THIS product: a value reused from the store's library
+ * ("Red") otherwise shows the library's colour (#ff0000) on a burgundy product. The store keeps an option's
+ * colour per product and draws it (plugin read 16-10-2026); it stores nothing when it equals the library's.
  */
 export function variationsBody(p, productId, { gvIds, optionIds, media }) {
   return {
@@ -439,14 +576,25 @@ export function variationsBody(p, productId, { gvIds, optionIds, media }) {
       options: p.options[oi].values.filter((x) => x.include !== false).map((v) => {
         const photo = valueImage(p, oi, v.source_value);
         const m = photo ? media[photo.file] : null;
-        const swatch = m?.id && p.options[oi].global_variation.type === 'images';
+        const type = p.options[oi].global_variation.type;
+        const swatch = m?.id && type === 'images';
         return { global_option_id: optionIds[oi].get(v.source_value),
+          ...(type === 'colorbox' && /^#[0-9a-f]{6}$/i.test(v.color_code || '') ? { color_code: v.color_code } : {}),
           ...(swatch ? { img_id: m.id, img_url: m.url } : {}),
           ...(m?.id ? { gallery_img_id: m.id } : {}) };
       }),
     })),
   };
 }
+
+/** A row from GET /product/variations, as POST /product/variations takes it back — the product's own choices. */
+export const asReplaceRow = (row) => ({
+  global_variation_id: row.global_variation_id,
+  is_active: row.is_active === 'no' ? 'no' : 'yes',
+  options: (row.options || []).map((o) => ({ global_option_id: o.global_option_id,
+    ...['title', 'color_code', 'img_url'].reduce((a, k) => (o[k] != null && o[k] !== '' ? { ...a, [k]: o[k] } : a), {}),
+    ...['img_id', 'gallery_img_id'].reduce((a, k) => (o[k] ? { ...a, [k]: o[k] } : a), {}) })),
+});
 
 /** The product SKU: the source's product SKU, or the variant SKU when only one variant is left. */
 export function productSku(p, src) {

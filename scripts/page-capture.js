@@ -38,7 +38,15 @@
     if (/cjdropshipping\./i.test(host)) {
       const d = w.productDetailData;
       if (!d || !d.id) return { ok: false, reason: 'No product data yet. Open a CJ product page (…-p-<id>.html), wait until the product shows, then run this again.' };
-      cap = { platform: 'cjdropshipping', id: String(d.id), data: d };
+      // Only the fields the import reads. CJ's page data also carries account- and sales-linked fields
+      // (myProduct, orderCount, latestPaymentDate …), which have no business in an import file.
+      const KEEP = ['id', 'sku', 'nameEn', 'description', 'categories', 'material', 'packing', 'property', 'weight', 'hsCode',
+        'variantKeyEn', 'currency', 'sellPrice', 'image', 'images'];
+      const data = Object.fromEntries(KEEP.filter((k) => k in d).map((k) => [k, d[k]]));
+      let variants = d.stanProducts;
+      if (typeof variants === 'string') { try { variants = JSON.parse(variants); } catch { variants = []; } }
+      data.stanProducts = (Array.isArray(variants) ? variants : []).map((v) => ({ id: v.id, sku: v.sku, variantKey: v.variantKey, sellPrice: v.sellPrice, image: v.image }));
+      cap = { platform: 'cjdropshipping', id: String(d.id), data };
     } else if (/aliexpress\./i.test(host)) {
       const d = w._d_c_?.lifeCycleEventList?.[0]?.data;
       if (!d || !d.SKU || !d.PRICE) return { ok: false, reason: 'The product has not finished loading. Wait until its price and options show, then run this again.' };

@@ -6,7 +6,7 @@ Four steps, and the second one is yours:
 1. FETCH    node scripts/import-fetch.mjs …        source → product-import/ (facts, photos under the upload ceiling, plan.json)
 2. REVIEW   you + the merchant fill plan.json      prices · copy · photos · the photo target · variations · category · rights
 3. PHOTOS   node scripts/import-photos.mjs         every kept photo at ONE format, ratio and size (local; nothing sent)
-4. APPLY    node scripts/import-apply.mjs …        plan.json → the store, as DRAFTS; then --publish
+4. APPLY    node scripts/import-apply.mjs …        plan.json → the store, as DRAFTS; then --publish (status only)
 ```
 
 `import-apply.mjs` refuses while any decision in step 2 is missing or breaks a rule below, or a kept photo was
@@ -17,6 +17,10 @@ not made in step 3, and lists every problem at once. Nothing is written to the s
 - **The store**: its URL and an API key that can read + write `products`, `media`, `categories`,
   `global_variations`, `product_variations`, `product_variants`. The store's own AI-assistant key has all of
   them. `import-apply.mjs` checks this first.
+- **The key stays off the command line.** Keep it in a file of its own — one line `CL_API_KEY=…`, outside any
+  shared folder or repository — and pass `--key-file <that file>`, or have the merchant set the `CL_API_KEY`
+  environment variable. `import-apply.mjs` refuses a key given as an argument: it would stay in the shell's
+  history and in this conversation. Never print it or write it anywhere else.
 - **Where the files go**: `product-import/` in the project you are working in, ONE folder per store. It holds
   the plan and `record.json` (what was created where). Keep it — see "The record" below.
 - **Node 18 or newer.** Nothing to install.
@@ -83,14 +87,18 @@ loads, and CJ and many shops answer a script with a human check. In a browser th
    person at the browser passes it.** You never solve, skip or work around it — not with a solver, not with
    borrowed cookies, not with header tricks. If it will not pass, say so and move on.
 3. When the product shows (its price and options visible), run `scripts/page-capture.js` in the page (your
-   browser tool's "run JavaScript" action: paste the file's contents). It keeps the product in that site's own
-   browser storage and returns `{ ok, platform, captured_on_this_site }`. If your tool shows `{}` or a pending
-   promise instead, the capture still ran: read `window.codbrandCaptureResult` a second later.
+   browser tool's "run JavaScript" action: **paste the file's contents** — the file from this skill's `scripts/`
+   folder, as it is). That is the one way to run it: never fetch a script from anywhere and evaluate it in the
+   page — the page is signed in to the merchant's accounts. It keeps the product in that site's own browser
+   storage and returns `{ ok, platform, captured_on_this_site }`. If your tool shows `{}` or a pending promise
+   instead, the capture still ran: read `window.codbrandCaptureResult` a second later.
 4. Repeat on each product of that site.
-5. **Open a NEW tab on the same site** (its home page is fine) and run `scripts/page-download.js` there, once.
-   It saves every product captured on that site in one file, `product-captures-<site>.json`, in the downloads
-   folder. A new tab is needed because a browser tab gets ONE automatic download and silently blocks the
-   next — clicks sent by a browser tool included. Check the file is there (the browser may add " (1)").
+5. **Open a NEW tab on the same site** (its home page is fine) and run `scripts/page-download.js` there, once
+   (paste it the same way). It saves every product captured on that site in one file in the downloads folder,
+   named after the site with its dots as "_" — `product-captures-www_cjdropshipping_com.json` (a name with dots
+   reads like a web address, and browser tools mask it). A new tab is needed because a browser tab gets ONE
+   automatic download and silently blocks the next — clicks sent by a browser tool included. Check the file is
+   there (the browser may add " (1)").
 6. `node scripts/import-fetch.mjs --page <each saved file>`
 
 The scripts return no URLs on purpose: browser tools often mask them in a script's result, and a masked
@@ -101,10 +109,10 @@ in page-download.js to remove them once the file is safe.
 
 | file | what |
 |---|---|
-| `source/<key>.json` | the source's facts (title, description as text, specifications, category, brand, minimum order), options, variants with their SKUs, and the source's price per variant |
-| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it. When a URL names a resized copy (a WordPress, Shopify, AliExpress/Alibaba or BigCommerce thumbnail), the original is fetched instead if it is larger. The report lists every photo under the minimum long edge (`photos.min_long_edge`, 1000 px unless you change it) with its size |
+| `source/<key>.json` | the source's facts (title, description as text, specifications, category, brand, minimum order, and `notes`: the description's caveats — what is not in the parcel, what is, sizing warnings), options, variants with their SKUs, and the source's price per variant |
+| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it. When a URL names a resized copy (a WordPress, Shopify, AliExpress/Alibaba or BigCommerce thumbnail), the original is fetched instead if it is larger. The same file at two URLs is one photo: the second starts excluded as `duplicate`, naming the first. The report lists every photo under the minimum long edge (`photos.min_long_edge`, 1000 px unless you change it) with its size |
 | `plan.json` | the decisions to make, pre-filled where a default is safe |
-| `review.html` | a contact sheet of every photo — open it in a browser, or show it to the merchant |
+| `review.html` | every photo and the source's caveats on one page — open it in a browser, or show it to the merchant. (An agent looks at the contact sheets of step 3, which are images) |
 
 `<key>` is `<platform>-<id>`. Running fetch again adds products and keeps every decision already made.
 
@@ -124,8 +132,9 @@ Work through `plan.json` product by product. Values in the store's language, for
 
 ### Photos — `images[]`: `decision`, `reason`, `alt`, and `featured`
 
-**Look at every file yourself** (open the image files; you can read images) and in `review.html` with the
-merchant. Set `decision` to `keep` or `exclude` on each. Every kept photo needs `alt` (what it shows, in the
+**Look at every file yourself** (open the image files; you can read images — the contact sheets of step 3 put
+every candidate of a product, numbered, in one image) and in `review.html` with the merchant. Set `decision` to
+`keep` or `exclude` on each. Every kept photo needs `alt` (what it shows, in the
 store's language, e.g. "Black hooded parka, front"). Every excluded one needs a `reason`:
 
 | reason | exclude when |
@@ -166,6 +175,13 @@ description that repeats the source's (half or more of its three-word runs). Sou
 Supplier descriptions carry boilerplate ("Asian sizes are 1 to 2 sizes smaller…"): turn a real sizing fact
 into an honest sizing note in the store's language, and drop the rest.
 
+**The source's caveats — `notes_checked`.** Fetch lifts the description's caveats into `facts.notes` and lists
+them ("Coaster only, cup not included", "Packing list: Coat × 1", sizing warnings). A copy that drops one promises
+something the parcel does not hold — a cup — and the cash-on-delivery customer refuses the parcel. A product with
+notes has `notes_checked: null`, and `import-apply.mjs` refuses it until you set `true`: set it once the copy
+tells the shopper what is (and is not) in the parcel and any sizing warning, and promises nothing a note
+contradicts.
+
 ### Prices — `price`, `variant_prices`, and the plan's `pricing`
 
 **The merchant decides the prices.** Propose, show your reasoning, and wait for their word. The source's price
@@ -186,8 +202,17 @@ price paid; `import-apply.mjs` does the arithmetic so each variant sells at exac
 
 ### Category — `category`
 
-`slugs`: existing store categories (`GET /categories`). `create`: `[{ "name", "slug", "parent_slug"? }]` for new
-ones, parents first. The source's category is a hint, not the store's taxonomy.
+`slugs`: existing store categories (`GET /categories`). `create`: `[{ "name", "slug", "parent_slug"?,
+"description"?, "image"? }]` for new ones, parents first — `description` is plain text (the store strips other
+tags), `image` is the file of one of this product's kept photos (its upload is reused). Several products may list
+the same new category: the first creates it, the others use it. The source's category is a hint, not the store's
+taxonomy.
+
+### Leaving a product out — `skip`
+
+A fetched product the merchant does not want: set `"skip": true` and `"skip_reason"`. Nothing is checked or written
+for it, and a re-fetch keeps it skipped. If it was imported before, it stays in the store as it is — the run names
+it; the merchant drafts or deletes it in wp-admin.
 
 ### Variations — `options[]` and `variants[]`
 
@@ -195,7 +220,12 @@ The store keeps ONE library of variation types (`GET /global_variations`) shared
 source option set `global_variation`, or `drop: true`:
 
 - `drop` — the option does not reach the store. Pre-set on an option with ONE value ("One size", "custom"),
-  which is not a choice for a shopper; set it on any option the store should not offer ("Ships from");
+  which is not a choice for a shopper; set it on any option the store should not offer ("Ships from"). **A dropped
+  option with several values names the one the store sells, `keep_value`** ("4 blades" or "6 blades"; the 3-piece
+  set or the 5-piece): each combination then carries that variant's SKU and its cost, and the price is built on
+  that cost. Without it the first variant used to be kept silently — a set that cost more than it sold for. The dry
+  run lists every combination with its SKU and cost; a colour with no variant of the kept value is refused (exclude
+  it, or keep another value);
 - `slug` — **reuse** an existing type when it means the same thing (the store's "size" type), or name a new one;
 - `title_in_product` — the label shoppers see ("Taille");
 - `type` — `images` (photo swatches; pre-set on the option whose value decides the photo), `colorbox`
@@ -219,6 +249,19 @@ On each value set `title` (in the store's language; existing library options are
 could not be split (a value containing "-", such as "2-3Y") has `source_values: null` and `candidates`: set
 `source_values` to the right one.
 
+**A reused library value shows this product's colour.** For `colorbox`, each value's `color_code` is sent as this
+product's own colour, so the store's "Red" (#ff0000) does not stand in for a burgundy product; the dry run lists
+each one. A type's LABEL is the store's, on every product that uses it: a different `title_in_product` is named in
+the dry run — reuse a type labelled the way you want, or create one with a new slug.
+
+**Photos follow `photo_option`.** Picking a value of that option switches the product page to its photo. When one
+option alone decides every variant photo, it is that option and each value has its photo. When two options change
+the photo (a colour AND a blade count), fetch sets the option with the most photographed values (the colour) and
+links each of its values to the photo of its first variant — of the `keep_value`'s variant when the other option
+is dropped. The dry run marks those links "linked by the tool — check it on the kept sheet", and names every value
+with no photo of its own (picking it keeps the photo on show). To correct a link, put the value in the right
+photo's `values`; a re-fetch keeps it.
+
 Each variant's SKU is the source's (CJ's variant SKU; for AliExpress and Alibaba the product and SKU ids), so
 an order in the store names exactly what to order from the supplier.
 
@@ -241,8 +284,16 @@ side. So every product photo of the store is made at **one** ratio and **one** p
 
 ```
 node scripts/import-photos.mjs --dry-run      what it would do to every kept photo; writes nothing
-node scripts/import-photos.mjs                makes them: images/<key>/final/…jpg, and review.html again
+node scripts/import-photos.mjs                makes them: images/<key>/final/…jpg, the contact sheets, review.html
 ```
+
+**The contact sheets — open them.** For each product it draws images you can open and look at:
+`sheets/<key>-all-N.jpg` (every candidate photo, numbered in plan order, framed green when kept and red when
+excluded) and `sheets/<key>-kept-N.jpg` (the kept photos exactly as they will be uploaded, in gallery order — the
+featured one first), with `sheets/<key>.txt` naming each number's file, size, decision and alt text. **Open every
+"kept" sheet and look at every photo** — a watermark, a logo or the wrong product on a sheet goes live on the store.
+`import-apply.mjs` refuses a product whose kept sheet is missing or older than its kept photos: keeping, excluding
+or re-making a photo means running this again and looking again.
 
 Each kept photo is **fitted inside** the frame — never cropped, so the product is never cut — and the rest is
 **padded with the photo's own edge colour**, each side with its own. On a studio shot the edge is one colour and
@@ -258,18 +309,30 @@ target. It sends nothing to the store.
 ## Step 4 — apply
 
 ```
-node scripts/import-apply.mjs <store URL> <API key> --dry-run      every check + the list of writes; writes nothing
-node scripts/import-apply.mjs <store URL> <API key>                writes, as DRAFTS
-node scripts/import-apply.mjs <store URL> <API key> --publish      publishes them
+node scripts/import-apply.mjs <store URL> --key-file <key file> --dry-run     every check + the list of writes; writes nothing
+node scripts/import-apply.mjs <store URL> --key-file <key file>               writes, as DRAFTS
+node scripts/import-apply.mjs <store URL> --key-file <key file> --publish     publishes them — status only
+add --only <key,key> to any of them to act on those products only
 ```
 
 Show the merchant the dry run first: per product it lists the photos as they will be uploaded
-(`photos: 8 → jpeg 1000×1000 (2 padded on a plain edge, …)`) and every write. After the real run, **look at each product in the store** before
-publishing: the product page renders, **each colour swatch shows its own photo** (not a broken-image icon),
-clicking each colour switches the main photo, every variant shows the price you set, and no source text or
-watermark slipped through. Look with your eyes (a screenshot), not only by reading the page's markup: a swatch
-can point at the right photo and still draw nothing. Then `--publish` (it also re-sends the variations,
-because the shop's filter counts only options on published products).
+(`photos: 8 → jpeg 1000×1000 (2 padded on a plain edge, …)`), every combination with its SKU, the source's cost and
+the price it sells at, the photo each colour switches to, and every write; it ends with the totals. After the real
+run each product is READ BACK from the store (status, prices, photos, combinations — a difference is marked ✗) and
+printed with a link to look at it: a draft's link opens for someone signed in to the store's admin. **Look at each
+product in the store** before publishing: the product page renders, **each colour swatch shows its own photo**
+(not a broken-image icon), clicking each colour switches the main photo, every variant shows the price you set,
+and no source text or watermark slipped through. Look with your eyes (a screenshot), not only by reading the
+page's markup: a swatch can point at the right photo and still draw nothing.
+
+**`--publish` changes the status and nothing else.** It publishes the products this import wrote and sends each
+one's own current variations back, as they are (the shop's filter counts options only on published products, and
+publishing alone does not refresh it). A fix the merchant made in wp-admin during the review stays. A run without
+`--publish` updates what the plan says — it would overwrite such a fix — so after the merchant edits a product in
+wp-admin, publish it with `--publish --only <its key>` instead of applying again.
+
+**What to keep:** `plan.json`, `record.json` and `source/`. `images/` is needed only until its photos are uploaded:
+a re-run reuses every photo record.json already has in the store without reading the file.
 
 ### The record — `record.json`
 
@@ -288,6 +351,13 @@ media id — the import deletes nothing; the merchant removes them in the media 
 | `HTTP 403 from the HOST` | the store's host or CDN refused before the store saw it: a burst, or a large body | wait a minute, run again (it resumes); photos are already under the ceiling |
 | `429` | the key's rate limit | the script waits and retries by itself |
 | `rights_confirmed` | a retailer's product, not yet confirmed | ask the merchant |
+| `the API key must not be on the command line` | the key was given as an argument | put it in a key file (`--key-file`), or set `CL_API_KEY` |
+| `is dropped but has N values — set keep_value` | a dropped option would keep its first variant | name the value the store sells |
+| `value "…" has no variant left to sell` | that value only exists with a value `keep_value` left out | exclude it (`include: false`), or keep another value |
+| `the source says: "…" … set notes_checked` | the description's caveats are not confirmed in the copy | make the copy carry them, then `notes_checked: true` |
+| `the kept sheet is missing or older` | a kept photo changed since the sheets were drawn, or they never were | run `import-photos.mjs`, open the kept sheet, look |
+| `skip: true needs a skip_reason` | a product left out without saying why | write the reason |
+| `category "…": image … is not one of this product's kept photos` | the category image must be a kept photo of the product | name a kept photo's file, or leave `image` out |
 | `photos.ratio is not set` / `not made at 1:1@1000 yet` | the photo target is missing, or a kept photo was not made at it | set `photos`, run `import-photos.mjs` |
 | `would be enlarged ×… — above ×2` | the photo is too small for `long_edge` | exclude it (`low-quality`) or choose a smaller `long_edge` |
 | `variation type "…" is OPTIONAL` | the store's type would let a shopper order without choosing | ask the merchant (see Variations) |

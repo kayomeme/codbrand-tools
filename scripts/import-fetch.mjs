@@ -28,7 +28,7 @@ import { createHash } from 'node:crypto';
 import { fetchProduct, fromCapture, capturesIn, NeedsBrowser } from './lib/sources/index.mjs';
 import { cjClient } from './lib/sources/cj-api.mjs';
 import { downloadBest, shrink, MAX_BYTES } from './lib/images.mjs';
-import { productEntry, mergePlan, keyOf, MIN_LONG_EDGE } from './lib/plan.mjs';
+import { productEntry, mergePlan, keyOf, foldTwins, MIN_LONG_EDGE } from './lib/plan.mjs';
 import { reviewHtml, PLATFORM, ROUTE, kb, sourceLongEdge } from './lib/review.mjs';
 
 const argv = process.argv.slice(2);
@@ -95,8 +95,9 @@ async function main() {
       n++;
       const stem = `${String(n).padStart(2, '0')}-${createHash('sha1').update(img.url).digest('hex').slice(0, 8)}`;
       const prev = old?.images?.find((x) => x.source_url === img.url && x.file && existsSync(join(OUT, x.file)));
+      const base = { url: img.url, roles: [...img.roles], values: [...img.values], ...(img.combos ? { combos: img.combos.map((c) => [...c]) } : {}) };
       if (prev) {
-        images.push({ file: prev.file, url: img.url, roles: img.roles, values: img.values, shrink: prev.shrink,
+        images.push({ ...base, file: prev.file, shrink: prev.shrink,
           ...(prev.original_url ? { original_url: prev.original_url } : {}), ...(prev.error ? { error: prev.error } : {}) });
         continue;
       }
@@ -104,16 +105,18 @@ async function main() {
         // the source's own original when the URL names a resized copy of it, and it is larger
         const got = await downloadBest(img.url);
         const r = await shrink(got.buffer, { url: got.url });
-        if (r.error) { images.push({ file: null, url: img.url, roles: img.roles, values: img.values, shrink: null, error: r.error }); continue; }
+        if (r.error) { images.push({ ...base, file: null, shrink: null, error: r.error }); continue; }
         const file = `images/${key}/${stem}.${r.ext}`;
         writeFileSync(join(OUT, file), r.buffer);
-        images.push({ file, url: img.url, roles: img.roles, values: img.values,
+        images.push({ ...base, file,
           ...(got.url !== img.url ? { original_url: got.url, larger: got.larger } : {}),
           shrink: { engine: r.engine, from: slim(r.from), to: slim(r.to), ...(r.warning ? { warning: r.warning } : {}) } });
       } catch (e) {
-        images.push({ file: null, url: img.url, roles: img.roles, values: img.values, shrink: null, error: e.message });
+        images.push({ ...base, file: null, shrink: null, error: e.message });
       }
     }
+    // the same file at two URLs: one photo, kept once (the other starts excluded as `duplicate`)
+    foldTwins(images, (i) => { try { return createHash('sha256').update(readFileSync(join(OUT, i.file))).digest('hex'); } catch { return null; } });
     fetched[key] = images;
     entries.push(productEntry(src, images));
   }
@@ -139,8 +142,12 @@ async function main() {
     const dropped = e.options.filter((o) => o.drop).map((o) => o.source_name);
     console.log(`• ${src.facts.title}  [${e.key}]`);
     console.log(`    from: ${PLATFORM[src.platform] || src.platform}, by ${ROUTE[src.route] || src.route}${src.supplier ? '' : ' — a RETAILER\'s own content: the merchant must confirm they may use it (rights_confirmed)'}`);
-    console.log(`    ${src.variants.length} variant(s)${src.options.length ? ` — ${src.options.map((o) => `${o.name}: ${o.values.length}`).join(', ')}` : ''}${src.image_option ? `; photo follows ${src.image_option}` : ''}${dropped.length ? `; dropped by default (one value): ${dropped.join(', ')}` : ''}${amb ? `; ${amb} to resolve by hand` : ''}`);
-    console.log(`    ${e.images.length} image(s): ${e.images.filter((i) => i.decision === 'unreviewed').length} to review, ${e.images.filter((i) => i.decision === 'exclude').length} excluded by default (description images, failures)`);
+    const follows = src.image_option ? `; photo follows ${src.image_option}` : e.photo_option ? `; photos change with more than one option — each ${e.photo_option} is linked to its first variant's photo (check them in the dry run)` : '';
+    console.log(`    ${src.variants.length} variant(s)${src.options.length ? ` — ${src.options.map((o) => `${o.name}: ${o.values.length}`).join(', ')}` : ''}${follows}${dropped.length ? `; dropped by default (one value): ${dropped.join(', ')}` : ''}${amb ? `; ${amb} to resolve by hand` : ''}`);
+    const twins = e.images.filter((i) => i.duplicate_of);
+    console.log(`    ${e.images.length} image(s): ${e.images.filter((i) => i.decision === 'unreviewed').length} to review, ${e.images.filter((i) => i.decision === 'exclude').length} excluded by default (description images, duplicates, failures)`);
+    if (twins.length) console.log(`    the same file twice (${twins.length}): ${twins.map((i) => `${i.file} = ${i.duplicate_of}`).join(', ')} — excluded as duplicate`);
+    if (src.facts.notes?.length) console.log(`    the source's caveats — the copy must carry them (notes_checked): ${src.facts.notes.map((n) => `"${n}"`).join(' · ')}`);
     if (shrunk.length) console.log(`    shrunk ${shrunk.length}: ${shrunk.map((i) => `${kb(i.shrink.from.bytes)}→${kb(i.shrink.to.bytes)} (${i.shrink.engine})`).join(', ')}`);
     if (larger.length) console.log(`    larger original used for ${larger.length}: ${larger.map((i) => `${i.larger.from.join('×')} → ${i.larger.to.join('×')}`).join(', ')}`);
     if (small.length) console.log(`    under ${minEdge} px on the long edge (${small.length}): ${small.map((i) => `${i.file} ${i.shrink.from.width}×${i.shrink.from.height}`).join(', ')}`);

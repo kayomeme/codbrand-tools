@@ -2,7 +2,8 @@
 // page-capture.js (any page of that site: its home page is fine).
 //
 // Saves every product captured on that site as ONE file, `product-captures-<site>.json`, in the browser's
-// downloads folder. Give that file to import-fetch.mjs --page.
+// downloads folder (`product-captures-www_cjdropshipping_com.json`: the site's dots become "_", because a name with
+// dots reads like a web address and browser tools mask it in what they show). Give that file to import-fetch.mjs --page.
 //
 // Why a new tab: browsers allow a tab ONE automatic download and silently block the rest — clicks sent by a
 // browser tool included (measured). A fresh tab's first download always goes through, and it sees the same
@@ -19,7 +20,7 @@
   try { all = JSON.parse(localStorage.getItem(STORE) || '{}'); } catch { all = {}; }
   const captures = Object.values(all);
   if (!captures.length) return { ok: false, reason: 'Nothing captured on this site yet. Run page-capture.js on each product page first.' };
-  const name = `product-captures-${location.host.replace(/[^0-9A-Za-z.-]/g, '')}.json`;
+  const name = `product-captures-${location.host.replace(/[^0-9A-Za-z-]/g, '_')}.json`;
   const payload = { kind: 'page-captures/1', site: location.host, saved_at: new Date().toISOString(), captures };
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: 'application/json' }));

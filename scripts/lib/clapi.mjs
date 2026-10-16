@@ -8,6 +8,31 @@
 //   - writes can carry an Idempotency-Key, so a retried create never creates twice.
 // What each door ACCEPTS is not here: the store describes itself (GET /me, /openapi, /docs/{slug}).
 
+/**
+ * The store and its API key for a script: the store URL from the command line (or CL_SITE / CL_API_BASE_URL),
+ * the key from `--key-file <file>` (a line `CL_API_KEY=…`) or the CL_API_KEY environment variable — NEVER from
+ * the command line: an argument stays in the shell's history, the process list and an agent's transcript.
+ * `positional` are the arguments that are not flags or flag values. -> { site, key } or { error } (never the key).
+ */
+export function storeAccess({ positional, keyFile = null, env = process.env, readFile }) {
+  if (positional.length > 1) {
+    return { error: 'the API key must not be on the command line — it stays in your shell\'s history and in this conversation. Put it in a file of its own, kept out of any shared folder or repository (one line: CL_API_KEY=…), and pass --key-file <that file>, or set the CL_API_KEY environment variable' };
+  }
+  let file = {};
+  if (keyFile) {
+    let text;
+    try { text = readFile(keyFile); } catch { return { error: `cannot read the key file ${keyFile}` }; }
+    file = Object.fromEntries(String(text).split(/\r?\n/).map((l) => l.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/)).filter(Boolean)
+      .map((m) => [m[1], m[2].replace(/^(['"])(.*)\1$/, '$2')]));
+    if (!file.CL_API_KEY) return { error: `the key file ${keyFile} has no CL_API_KEY=… line` };
+  }
+  const key = file.CL_API_KEY || env.CL_API_KEY;
+  const site = positional[0] || file.CL_SITE || file.CL_API_BASE_URL || env.CL_SITE || env.CL_API_BASE_URL;
+  if (!site) return { error: 'the store URL is missing — give it as the first argument (or CL_SITE in the key file)' };
+  if (!key) return { error: 'no API key — pass --key-file <key file> (a line CL_API_KEY=…), or set the CL_API_KEY environment variable' };
+  return { site, key };
+}
+
 export class ApiError extends Error {
   constructor(message, { status, code, body } = {}) { super(message); this.status = status; this.code = code; this.body = body; }
 }

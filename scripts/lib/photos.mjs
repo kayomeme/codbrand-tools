@@ -45,6 +45,13 @@ async function pixels(buf, from, url) {
   try { return decodePng(png); } catch { return null; }
 }
 
+/** Pixels of any photo a converter can read, transparency on white — or null. (Used for contact sheets too.) */
+export async function readPixels(buf, url = null) {
+  const img = await pixels(buf, probe(buf), url);
+  if (img) flattenWhite(img.data);
+  return img;
+}
+
 /** Bilinear enlargement (the area-average in images.mjs only shrinks). */
 export function enlargeRGBA(src, w, h, nw, nh) {
   const out = new Uint8Array(nw * nh * 4);

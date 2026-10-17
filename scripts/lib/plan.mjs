@@ -354,6 +354,11 @@ export function checkPlan(plan, sources, ctx = {}) {
     }
     const kept = p.images.filter((i) => i.decision === 'keep');
     if (!kept.length) err(p.key, 'images', 'no image kept — a product needs at least one');
+    // the same file kept twice is the same photo twice in the gallery (copies kept before a re-fetch found them)
+    for (const files of keptCopies(p.images)) {
+      const others = files.length > 2 ? 'the others' : 'the other';
+      err(p.key, 'images', `${files.join(' = ')} are the same file, and each is kept — the gallery would show it ${files.length === 2 ? 'twice' : `${files.length} times`}: keep one and exclude ${others} with reason "duplicate"; a colour an excluded copy stands for (its "values") goes on the one kept — then check the dry run's colour lines`);
+    }
     if (p.featured && kept.length && !kept.some((i) => i.file === p.featured)) err(p.key, 'images', `featured image ${p.featured} is not kept — point "featured" at a kept image`);
 
     // PHOTOS — what is uploaded is the photos step's file, made at the plan's one ratio and size
@@ -551,6 +556,22 @@ export function foldTwins(images, hashOf) {
     img.duplicate_of = twin.file;
   }
   return images;
+}
+
+/**
+ * The same file KEPT more than once. A copy found by a fresh fetch starts excluded, but a decision made before
+ * stays (a re-fetch never changes one), so copies kept before the fetch found them stay kept — the same photo twice
+ * in the gallery. -> [[file, file, …], …]: the kept copies of each file kept twice or more.
+ */
+export function keptCopies(images) {
+  const sets = new Map(); // the first copy (the one the others are duplicate_of) -> the kept copies
+  for (const i of images) {
+    if (!i.file) continue;
+    const first = i.duplicate_of || i.file;
+    if (!sets.has(first)) sets.set(first, []);
+    if (i.decision === 'keep') sets.get(first).push(i.file);
+  }
+  return [...sets.values()].filter((kept) => kept.length > 1);
 }
 
 // ── what the store is sent ────────────────────────────────────────────────────────────────────────

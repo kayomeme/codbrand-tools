@@ -28,7 +28,7 @@ import { createHash } from 'node:crypto';
 import { fetchProduct, fromCapture, capturesIn, NeedsBrowser } from './lib/sources/index.mjs';
 import { cjClient } from './lib/sources/cj-api.mjs';
 import { downloadBest, shrink, MAX_BYTES } from './lib/images.mjs';
-import { productEntry, mergePlan, keyOf, foldTwins, MIN_LONG_EDGE } from './lib/plan.mjs';
+import { productEntry, mergePlan, keyOf, foldTwins, keptCopies, MIN_LONG_EDGE } from './lib/plan.mjs';
 import { reviewHtml, PLATFORM, ROUTE, kb, sourceLongEdge } from './lib/review.mjs';
 
 const argv = process.argv.slice(2);
@@ -144,9 +144,13 @@ async function main() {
     console.log(`    from: ${PLATFORM[src.platform] || src.platform}, by ${ROUTE[src.route] || src.route}${src.supplier ? '' : ' — a RETAILER\'s own content: the merchant must confirm they may use it (rights_confirmed)'}`);
     const follows = src.image_option ? `; photo follows ${src.image_option}` : e.photo_option ? `; photos change with more than one option — each ${e.photo_option} is linked to its first variant's photo (check them in the dry run)` : '';
     console.log(`    ${src.variants.length} variant(s)${src.options.length ? ` — ${src.options.map((o) => `${o.name}: ${o.values.length}`).join(', ')}` : ''}${follows}${dropped.length ? `; dropped by default (one value): ${dropped.join(', ')}` : ''}${amb ? `; ${amb} to resolve by hand` : ''}`);
-    const twins = e.images.filter((i) => i.duplicate_of);
+    // the same file at two URLs: a copy found now starts excluded, but a decision made before stays — copies kept
+    // before are named, and import-apply refuses them
+    const keptTwice = keptCopies(e.images);
+    const twins = e.images.filter((i) => i.duplicate_of && !keptTwice.some((files) => files.includes(i.file)));
     console.log(`    ${e.images.length} image(s): ${e.images.filter((i) => i.decision === 'unreviewed').length} to review, ${e.images.filter((i) => i.decision === 'exclude').length} excluded by default (description images, duplicates, failures)`);
-    if (twins.length) console.log(`    the same file twice (${twins.length}): ${twins.map((i) => `${i.file} = ${i.duplicate_of}`).join(', ')} — excluded as duplicate`);
+    if (twins.length) console.log(`    the same file twice (${twins.length}): ${twins.map((i) => `${i.file} = ${i.duplicate_of}`).join(', ')} — not both kept (a copy found now starts excluded as duplicate)`);
+    for (const files of keptTwice) console.log(`    ✗ the same file, KEPT ${files.length} times by a decision made before (a re-fetch never changes one): ${files.join(' = ')} — keep one, exclude ${files.length > 2 ? 'the others' : 'the other'} (reason "duplicate"); import-apply refuses until then`);
     if (src.facts.notes?.length) console.log(`    the source's caveats — the copy must carry them (notes_checked): ${src.facts.notes.map((n) => `"${n}"`).join(' · ')}`);
     if (shrunk.length) console.log(`    shrunk ${shrunk.length}: ${shrunk.map((i) => `${kb(i.shrink.from.bytes)}→${kb(i.shrink.to.bytes)} (${i.shrink.engine})`).join(', ')}`);
     if (larger.length) console.log(`    larger original used for ${larger.length}: ${larger.map((i) => `${i.larger.from.join('×')} → ${i.larger.to.join('×')}`).join(', ')}`);

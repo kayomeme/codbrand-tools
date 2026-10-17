@@ -2,7 +2,7 @@
 // page-capture.js (any page of that site: its home page is fine).
 //
 // Saves every product captured on that site as ONE file, `product-captures-<site>.json`, in the browser's
-// downloads folder (`product-captures-www_cjdropshipping_com.json`: the site's dots become "_", because a name with
+// downloads folder (`product-captures-cjdropshipping_com.json`: the site's dots become "_", because a name with
 // dots reads like a web address and browser tools mask it in what they show). Give that file to import-fetch.mjs --page.
 //
 // Why a new tab: browsers allow a tab ONE automatic download and silently block the rest — clicks sent by a

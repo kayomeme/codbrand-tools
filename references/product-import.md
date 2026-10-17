@@ -95,7 +95,7 @@ loads, and CJ and many shops answer a script with a human check. In a browser th
 4. Repeat on each product of that site.
 5. **Open a NEW tab on the same site** (its home page is fine) and run `scripts/page-download.js` there, once
    (paste it the same way). It saves every product captured on that site in one file in the downloads folder,
-   named after the site with its dots as "_" — `product-captures-www_cjdropshipping_com.json` (a name with dots
+   named after the site with its dots as "_" — `product-captures-cjdropshipping_com.json` (a name with dots
    reads like a web address, and browser tools mask it). A new tab is needed because a browser tab gets ONE
    automatic download and silently blocks the next — clicks sent by a browser tool included. Check the file is
    there (the browser may add " (1)").
@@ -110,7 +110,7 @@ in page-download.js to remove them once the file is safe.
 | file | what |
 |---|---|
 | `source/<key>.json` | the source's facts (title, description as text, specifications, category, brand, minimum order, and `notes`: the description's caveats — what is not in the parcel, what is, sizing warnings), options, variants with their SKUs, and the source's price per variant |
-| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it. When a URL names a resized copy (a WordPress, Shopify, AliExpress/Alibaba or BigCommerce thumbnail), the original is fetched instead if it is larger. The same file at two URLs is one photo: the second starts excluded as `duplicate`, naming the first. The report lists every photo under the minimum long edge (`photos.min_long_edge`, 1000 px unless you change it) with its size |
+| `images/<key>/NN-….jpg` | every photo, under the upload ceiling (450 KB): one already under it is kept as it is; one over it is re-encoded, at most 1600 px wide. The plan records the size before → after and the engine that did it. When a URL names a resized copy (a WordPress, Shopify, AliExpress/Alibaba or BigCommerce thumbnail), the original is fetched instead if it is larger. The same file at two URLs is one photo: the second starts excluded as `duplicate`, naming the first (`duplicate_of`). A re-fetch never changes a decision already made, so copies kept before stay kept: the report marks them ✗ and `import-apply.mjs` refuses until only one is kept. The report lists every photo under the minimum long edge (`photos.min_long_edge`, 1000 px unless you change it) with its size |
 | `plan.json` | the decisions to make, pre-filled where a default is safe |
 | `review.html` | every photo and the source's caveats on one page — open it in a browser, or show it to the merchant. (An agent looks at the contact sheets of step 3, which are images) |
 
@@ -356,6 +356,7 @@ media id — the import deletes nothing; the merchant removes them in the media 
 | `value "…" has no variant left to sell` | that value only exists with a value `keep_value` left out | exclude it (`include: false`), or keep another value |
 | `the source says: "…" … set notes_checked` | the description's caveats are not confirmed in the copy | make the copy carry them, then `notes_checked: true` |
 | `the kept sheet is missing or older` | a kept photo changed since the sheets were drawn, or they never were | run `import-photos.mjs`, open the kept sheet, look |
+| `… are the same file, and each is kept` | copies of one photo kept before fetch found them (a re-fetch keeps decisions) | keep one, exclude the others (`duplicate`); move an excluded copy's `values` to the kept one; check the colour lines |
 | `skip: true needs a skip_reason` | a product left out without saying why | write the reason |
 | `category "…": image … is not one of this product's kept photos` | the category image must be a kept photo of the product | name a kept photo's file, or leave `image` out |
 | `photos.ratio is not set` / `not made at 1:1@1000 yet` | the photo target is missing, or a kept photo was not made at it | set `photos`, run `import-photos.mjs` |

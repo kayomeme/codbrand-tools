@@ -18,7 +18,8 @@
  *   rights    a product from a retailer's own store (not a supplier platform) lacks rights_confirmed: true
  *   price     a product or variant has no retail price, or a price is the source's own price, or at/below cost × fx
  *   copy      the title or description is missing or is the source's text as-is; no language set
- *   images    an image is unreviewed, kept without alt text, over the size ceiling, or excluded without a reason
+ *   images    an image is unreviewed, kept without alt text, over the size ceiling, or excluded without a reason;
+ *             the same file is kept twice
  *   photos    the plan has no photo target, or a kept photo was not made at it by import-photos.mjs
  *   variants  an option is not mapped onto the store's variation library (nor dropped), or a split is unresolved;
  *             the store's type it would reuse is OPTIONAL (a shopper could order without choosing), or a type

@@ -1,4 +1,4 @@
-// clapi.mjs — a small client for the store's own API (COD Leads `cl-api/v1`).
+// clapi.mjs — a small client for the store's own API (CodBrand `cl-api/v1`).
 //
 // It carries only what the API cannot tell you about calling it safely:
 //   - pacing: at most 4 requests a second. Shared-hosting CDNs answer a burst with a bare 403 page, and a

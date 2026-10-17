@@ -1,14 +1,14 @@
 # codbrand-tools — references & scripts
 
 Everything the `codbrand-tools` skill uses, except its entry point. The skill is a toolbox for stores
-running the COD Leads plugin. Its first tool imports products into the store — from CJdropshipping,
+running the CodBrand plugin. Its first tool imports products into the store — from CJdropshipping,
 AliExpress, Alibaba, a Shopify or WooCommerce store, or any product page. Facts, photos, variants and
 category go in as drafts, with the merchant's own prices and copy rewritten for the store's language and
 country.
 
 ## This is most of a skill, but not its entry point
 
-`SKILL.md` — the skill's instructions — **ships inside the COD Leads plugin** and is installed from
+`SKILL.md` — the skill's instructions — **ships inside the CodBrand plugin** and is installed from
 there. Everything `SKILL.md` refers to lives here:
 
 | in this repository | ships with the plugin |
